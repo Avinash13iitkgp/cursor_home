@@ -72,6 +72,20 @@ def test_crash_mid_copy_is_rebuilt(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert (session / ".ready").is_file()
 
 
+def test_ready_workspace_is_left_in_place(tmp_path: Path) -> None:
+    cow = tmp_path / "cow"
+    seed_base(cow, DUMMY)
+    session = cow / "sessions" / "s_custom"
+    workspace = session / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "hello.py").write_text("print('custom')\n", encoding="utf-8")
+    atomic_write(session / ".ready", '{"version": 1}\n')
+    ensured = ensure_session(cow, "s_custom")
+    assert ensured.created is False
+    assert (ensured.path / "hello.py").read_text(encoding="utf-8") == "print('custom')\n"
+    assert not (ensured.path / "TASK.md").exists()
+
+
 def test_rejects_path_like_session_ids(tmp_path: Path) -> None:
     cow = tmp_path / "cow"
     seed_base(cow, DUMMY)

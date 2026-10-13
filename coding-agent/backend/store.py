@@ -59,6 +59,7 @@ class Session:
     lease_expires_at: float | None
     final_answer: str | None
     error: str | None
+    import_id: str | None
     created_at: float
     updated_at: float
 
@@ -339,6 +340,8 @@ class Store:
         system_prompt: str,
         idempotency_key: str | None,
         title: str | None = None,
+        session_id: str | None = None,
+        import_id: str | None = None,
     ) -> Session:
         now = time.time()
         with self._tx() as conn:
@@ -349,16 +352,16 @@ class Store:
                 ).fetchone()
                 if existing is not None:
                     return _session(existing)
-            session_id = "s_" + uuid4().hex[:12]
+            session_id = session_id or ("s_" + uuid4().hex[:12])
             chosen = title.strip() if title and title.strip() else _title(prompt)
             conn.execute(
                 """
                 INSERT INTO sessions (
                   session_id, idempotency_key, title, prompt, status, step, max_steps,
-                  created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+                  import_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?)
                 """,
-                (session_id, idempotency_key, chosen, prompt, max_steps, now, now),
+                (session_id, idempotency_key, chosen, prompt, max_steps, import_id, now, now),
             )
             self._insert_message(conn, session_id, 0, "system", system_prompt, None, None, 0, now)
             self._insert_message(conn, session_id, 1, "user", prompt, None, None, 0, now)
@@ -366,10 +369,14 @@ class Store:
                 conn,
                 session_id=session_id,
                 type="session.created",
-                payload={"title": chosen, "max_steps": max_steps},
+                payload={"title": chosen, "max_steps": max_steps, "import_id": import_id},
             )
             row = conn.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
             return _session(row)
+
+    def get_by_idempotency(self, key: str) -> Session | None:
+        row = self._one("SELECT * FROM sessions WHERE idempotency_key=?", (key,))
+        return _session(row) if row is not None else None
 
     def get_session(self, session_id: str) -> Session:
         row = self._one("SELECT * FROM sessions WHERE session_id=?", (session_id,))
@@ -898,6 +905,7 @@ def _session(row: sqlite3.Row) -> Session:
         lease_expires_at=row["lease_expires_at"],
         final_answer=row["final_answer"],
         error=row["error"],
+        import_id=row["import_id"],
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
     )

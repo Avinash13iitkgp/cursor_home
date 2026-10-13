@@ -17,6 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from backend.agent import Agent
 from backend.config import Settings, load_settings
 from backend.events import EventLog
+from backend.imports import ImportError as FolderImportError
+from backend.imports import load_import, materialize_import, read_workspace_file, save_import
 from backend.hosts import DaemonClient, DockerControl, DockerError
 from backend.llm import GrokClient
 from backend.runner import Runner
@@ -63,6 +65,7 @@ def _session_dict(session: Session) -> dict[str, Any]:
         "lease_expires_at": session.lease_expires_at,
         "final_answer": session.final_answer,
         "error": session.error,
+        "import_id": session.import_id,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
     }
@@ -210,6 +213,18 @@ def create_app(
         title = body.get("title")
         if title is not None and not isinstance(title, str):
             raise HTTPException(status_code=400, detail="title must be a string")
+        import_id = body.get("import_id")
+        if import_id is not None and not isinstance(import_id, str):
+            raise HTTPException(status_code=400, detail="import_id must be a string")
+        existing = await asyncio.to_thread(store.get_by_idempotency, idempotency_key)
+        if existing is not None:
+            return {"session": _session_dict(existing)}
+        session_id = "s_" + uuid4().hex[:12]
+        if import_id:
+            try:
+                await asyncio.to_thread(materialize_import, settings.cow_root, session_id, import_id)
+            except FolderImportError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         session = await asyncio.to_thread(
             store.create_session,
             prompt=prompt,
@@ -217,8 +232,42 @@ def create_app(
             system_prompt=_system_prompt(),
             idempotency_key=idempotency_key,
             title=title,
+            session_id=session_id,
+            import_id=import_id,
         )
         return {"session": _session_dict(session)}
+
+    @app.post("/api/imports")
+    async def create_import(body: dict[str, Any]) -> dict[str, Any]:
+        files = body.get("files")
+        if not isinstance(files, list):
+            raise HTTPException(status_code=400, detail="files is required")
+        name = body.get("name")
+        if name is not None and not isinstance(name, str):
+            raise HTTPException(status_code=400, detail="name must be a string")
+        try:
+            saved = await asyncio.to_thread(save_import, settings.cow_root, name or "", files)
+        except FolderImportError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return saved
+
+    @app.get("/api/imports/{import_id}")
+    async def get_import(import_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(load_import, settings.cow_root, import_id)
+        except FolderImportError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/sessions/{session_id}/file")
+    async def session_file(session_id: str, path: str) -> dict[str, str]:
+        try:
+            await asyncio.to_thread(store.get_session, session_id)
+            content = await asyncio.to_thread(read_workspace_file, settings.cow_root, session_id, path)
+        except SessionNotFound as exc:
+            raise HTTPException(status_code=404, detail="session not found") from exc
+        except FolderImportError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"path": path, "content": content}
 
     @app.get("/api/sessions")
     async def list_sessions() -> dict[str, Any]:

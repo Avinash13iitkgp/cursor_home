@@ -118,6 +118,31 @@ def test_sessions_are_idempotent_and_cancelable(tmp_path: Path) -> None:
     store.close()
 
 
+def test_folder_import_seeds_the_session_workspace(tmp_path: Path) -> None:
+    client, store, _events, _scheduler = _app(tmp_path)
+    with client:
+        uploaded = client.post(
+            "/api/imports",
+            json={"name": "sample", "files": [{"path": "pkg/hello.py", "content": "print('loaded')\n"}]},
+        )
+        assert uploaded.status_code == 200
+        import_id = uploaded.json()["import_id"]
+        created = client.post(
+            "/api/sessions",
+            json={"prompt": "edit hello", "import_id": import_id},
+            headers={"Idempotency-Key": "folder"},
+        )
+        assert created.status_code == 200
+        session = created.json()["session"]
+        assert session["import_id"] == import_id
+        body = client.get("/api/sessions/%s/file" % session["session_id"], params={"path": "pkg/hello.py"})
+        assert body.status_code == 200
+        assert body.json()["content"] == "print('loaded')\n"
+        listed = client.get("/api/imports/%s" % import_id)
+        assert listed.json()["files"][0]["path"] == "pkg/hello.py"
+    store.close()
+
+
 def test_kill_host_does_not_start_a_replacement(tmp_path: Path) -> None:
     client, store, _events, scheduler = _app(tmp_path)
     store.upsert_host("host-a", "http://127.0.0.1:7701", "coding-agent-host-a", 7701)

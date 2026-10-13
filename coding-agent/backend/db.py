@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   lease_expires_at  REAL,
   final_answer      TEXT,
   error             TEXT,
+  import_id         TEXT,
   created_at        REAL NOT NULL,
   updated_at        REAL NOT NULL
 );
@@ -99,4 +100,11 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "import_id" not in columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN import_id TEXT")

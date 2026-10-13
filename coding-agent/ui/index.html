@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Coding agent</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Coding agent</h1>
+    <span id="connection" class="pill" data-state="reconnecting" aria-live="polite">reconnecting (0)</span>
+    <span id="supervisor" class="supervisor">supervisor …</span>
+    <button type="button" id="kill-backend" class="danger">Kill backend</button>
+  </header>
+  <main class="columns">
+    <section class="col tasks" aria-label="Tasks">
+      <form id="task-form">
+        <label for="prompt">New task</label>
+        <textarea id="prompt" rows="7" placeholder="What should the agent do?"></textarea>
+        <div class="form-actions">
+          <button type="button" id="open-folder">Open folder</button>
+          <button type="button" id="dummy">Use dummy repo task</button>
+          <button type="submit" id="start">Start</button>
+        </div>
+        <input id="folder-input" type="file" webkitdirectory directory multiple hidden>
+        <p id="folder-label" class="folder-label">Workspace: dummy repo <button type="button" id="clear-folder" hidden>Use dummy repo</button></p>
+        <p id="form-error" class="form-error" hidden></p>
+      </form>
+      <div id="sessions" class="session-list"></div>
+    </section>
+    <section class="col session" aria-label="Session">
+      <header class="session-header">
+        <div>
+          <h2 id="session-title">No session</h2>
+          <p id="session-meta" class="meta"></p>
+        </div>
+        <div class="session-actions">
+          <button type="button" id="live-code" aria-pressed="false" disabled>Live code</button>
+          <button type="button" id="cancel" disabled>Cancel</button>
+        </div>
+      </header>
+      <div id="banners" class="banners"></div>
+      <section id="code-panel" class="code-panel" hidden>
+        <div id="code-files" class="code-files"></div>
+        <div class="code-main">
+          <p id="code-status" class="code-status"></p>
+          <pre id="code-view" class="code-view"></pre>
+        </div>
+      </section>
+      <div id="transcript" class="transcript"></div>
+      <section id="final" class="final" hidden>
+        <h3>Final answer</h3>
+        <p></p>
+      </section>
+    </section>
+    <section class="col system" aria-label="System">
+      <div>
+        <h2>Hosts</h2>
+        <div id="hosts" class="hosts"></div>
+      </div>
+      <div class="timeline-wrap">
+        <div class="section-head">
+          <h2>Timeline</h2>
+          <label class="filter"><input id="tool-only" type="checkbox"> Tool events only</label>
+        </div>
+        <div id="timeline" class="timeline"></div>
+      </div>
+      <div>
+        <h2>Changed files</h2>
+        <div id="changed" class="changed"></div>
+      </div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
