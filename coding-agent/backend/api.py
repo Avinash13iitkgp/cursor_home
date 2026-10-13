@@ -18,7 +18,7 @@ from backend.agent import Agent
 from backend.config import Settings, load_settings
 from backend.events import EventLog
 from backend.imports import ImportError as FolderImportError
-from backend.imports import load_import, materialize_import, read_workspace_file, save_import
+from backend.imports import import_tree, list_workspace_files, load_import, materialize_import, read_workspace_file, save_import
 from backend.hosts import DaemonClient, DockerControl, DockerError
 from backend.llm import GrokClient
 from backend.runner import Runner
@@ -258,6 +258,23 @@ def create_app(
         except FolderImportError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.post("/api/imports/dummy")
+    async def import_dummy() -> dict[str, Any]:
+        source = settings.root / "dummy-repo"
+        try:
+            return await asyncio.to_thread(import_tree, settings.cow_root, "dummy-repo", source)
+        except FolderImportError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/sessions/{session_id}/files")
+    async def session_files(session_id: str) -> dict[str, Any]:
+        try:
+            await asyncio.to_thread(store.get_session, session_id)
+            files = await asyncio.to_thread(list_workspace_files, settings.cow_root, session_id)
+        except SessionNotFound as exc:
+            raise HTTPException(status_code=404, detail="session not found") from exc
+        return {"files": files}
+
     @app.get("/api/sessions/{session_id}/file")
     async def session_file(session_id: str, path: str) -> dict[str, str]:
         try:
@@ -410,10 +427,13 @@ def __getattr__(name: str) -> FastAPI:
 
 def _system_prompt() -> str:
     return (
-        "You are a coding agent working in a workspace that already contains a Python project. "
-        "Inspect and edit files only through the provided tools. "
+        "You are a coding agent working in one session workspace that already contains a Python project. "
+        "Inspect and edit files with the provided tools. "
         "Paths are relative to the workspace root. "
-        "When the task is finished, reply with a short summary and do not call any tools."
+        "After you change code, call run_tests. The default target workspace is this session's tree: the base snapshot plus your edits. "
+        "Call run_tests with target baseline to run the unmodified base snapshot and see which failures were already there. "
+        "If the suite fails, fix the code and call run_tests again. "
+        "When the task is finished and run_tests reports that the suite passed, reply with a short summary and do not call any tools."
     )
 
 
