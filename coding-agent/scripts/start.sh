@@ -31,7 +31,12 @@ supervisor_port="$(grep -E '^SUPERVISOR_PORT=' .env | tail -1 | cut -d= -f2-)"
 supervisor_port="${supervisor_port:-8090}"
 
 echo "Starting host-a and host-b..."
-docker compose up -d --build
+# A replaced host is started with docker run, so it keeps the name but is not a
+# Compose container. The next `up` then tries to create that name and stops here.
+if ! docker compose up -d --build; then
+  echo "Compose could not create the host containers. Starting the ones already named host-a and host-b."
+  docker start coding-agent-host-a coding-agent-host-b
+fi
 
 echo "Waiting for the daemons..."
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do

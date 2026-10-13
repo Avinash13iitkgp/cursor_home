@@ -64,8 +64,8 @@ Use `b` if the session is on host-b.
 
 What happens:
 
-1. The backend marks that host `down` and moves the session to the other healthy host. The banner says **migrated host-a → host-b**, and the session title leaves the killed card.
-2. The card stays `down` for about 20 seconds. The replacement container is not started until that delay has passed.
+1. The card goes `suspect`. The session stays on that host until 3 heartbeats are missed.
+2. The card goes `down`. The banner says **migrated host-a → host-b**, and the session title leaves the killed card. The replacement container is not started until 20 seconds after the kill.
 3. The card then shows `replacing`, then healthy with generation `g2` and a new short `boot_id`. It no longer owns the session.
 4. The in-flight tool runs on the other host. The card shows a higher attempt count. If the first attempt had already been journaled, the badge says `replayed` and the file is not written twice. **Live code** still shows the same workspace.
 
