@@ -40,10 +40,22 @@ class AssistantTurn:
 
 
 @dataclass(frozen=True)
+class ToolDelta:
+    index: int
+    name: str = ""
+    arguments: str = ""
+
+
+@dataclass(frozen=True)
 class StreamEvent:
+    """One live chunk. kind is reasoning, text, tool, or done."""
+
     kind: str
     text: str = ""
     turn: AssistantTurn | None = None
+    index: int = 0
+    name: str = ""
+    arguments: str = ""
 
 
 @dataclass
@@ -52,9 +64,11 @@ class TurnBuilder:
     reasoning: list[str] = field(default_factory=list)
     calls: dict[int, dict[str, str]] = field(default_factory=dict)
     last_reasoning: str = ""
+    tool_deltas: list[ToolDelta] = field(default_factory=list)
 
     def apply(self, payload: dict[str, Any]) -> str:
         self.last_reasoning = ""
+        self.tool_deltas = []
         if payload.get("done"):
             return ""
         choices = payload.get("choices") or []
@@ -75,12 +89,18 @@ class TurnBuilder:
             acc = self.calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
             if tool_call.get("id"):
                 acc["id"] += str(tool_call["id"])
+            name = ""
+            arguments = ""
             function = tool_call.get("function") or {}
             if isinstance(function, dict):
                 if function.get("name"):
-                    acc["name"] += str(function["name"])
+                    name = str(function["name"])
+                    acc["name"] += name
                 if function.get("arguments"):
-                    acc["arguments"] += str(function["arguments"])
+                    arguments = str(function["arguments"])
+                    acc["arguments"] += arguments
+            if name or arguments:
+                self.tool_deltas.append(ToolDelta(index=index, name=name, arguments=arguments))
         return str(text)
 
     def turn(self) -> AssistantTurn:
@@ -163,6 +183,13 @@ class GrokClient:
                         yield StreamEvent(kind="reasoning", text=builder.last_reasoning)
                     if text:
                         yield StreamEvent(kind="text", text=text)
+                    for delta in builder.tool_deltas:
+                        yield StreamEvent(
+                            kind="tool",
+                            index=delta.index,
+                            name=delta.name,
+                            arguments=delta.arguments,
+                        )
         except LlmRetryable:
             raise
         except LlmFatal:

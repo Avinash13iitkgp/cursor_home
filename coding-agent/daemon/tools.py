@@ -6,6 +6,7 @@ import fnmatch
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -17,7 +18,12 @@ from daemon.fsutil import atomic_write
 MAX_HITS = 200
 MAX_READ_LINES = 4000
 MAX_TEST_OUTPUT = 16000
+MAX_SHELL_OUTPUT = 16000
+MAX_SHELL_COMMAND = 100000
 TEST_TIMEOUT_S = 45
+SHELL_TIMEOUT_DEFAULT_S = 30
+SHELL_TIMEOUT_MAX_S = 45
+_SHELL_DRAIN_S = 5
 _TEST_PATTERN = re.compile(r"[A-Za-z0-9_.*?-]+")
 
 
@@ -129,6 +135,34 @@ def tool_specs() -> list[dict[str, Any]]:
                         "description": "File glob passed to unittest discover. Defaults to test*.py.",
                     },
                 },
+            },
+        },
+        {
+            "name": "shell",
+            "description": (
+                "Run any command via /bin/sh -c in the session workspace inside this container. "
+                "cwd defaults to the workspace root. "
+                "A non-zero exit is a normal result, not an error. "
+                "Output is clipped. "
+                "The same op_id is replayed by the journal and does not run again."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Command string passed to /bin/sh -c.",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Relative working directory inside the workspace. Defaults to .",
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "description": "Timeout in seconds from 1 to 45. Defaults to 30.",
+                    },
+                },
+                "required": ["command"],
             },
         },
     ]
@@ -377,11 +411,175 @@ def _is_baseline(path: Path) -> bool:
         return False
 
 
-def _clip(text: str) -> str:
-    if len(text) <= MAX_TEST_OUTPUT:
+def _clip(text: str, limit: int = MAX_TEST_OUTPUT) -> str:
+    if len(text) <= limit:
         return text
-    omitted = len(text) - MAX_TEST_OUTPUT
-    return "... %s characters omitted ...\n%s" % (omitted, text[-MAX_TEST_OUTPUT:])
+    omitted = len(text) - limit
+    return "... %s characters omitted ...\n%s" % (omitted, text[-limit:])
+
+
+def _shell(workspace: Path, arguments: dict[str, Any]) -> str:
+    command = arguments.get("command")
+    if not isinstance(command, str) or command == "":
+        raise ToolError("command must be a non-empty string")
+    if len(command) > MAX_SHELL_COMMAND:
+        raise ToolError("command must be at most %s characters" % MAX_SHELL_COMMAND)
+    raw_cwd = arguments.get("cwd", ".")
+    if not isinstance(raw_cwd, str):
+        raise ToolError("cwd must be a string")
+    start = confine(workspace, raw_cwd)
+    if not start.is_dir():
+        raise ToolError("not a directory")
+    timeout_s = arguments.get("timeout_s", SHELL_TIMEOUT_DEFAULT_S)
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, int)
+        or timeout_s < 1
+        or timeout_s > SHELL_TIMEOUT_MAX_S
+    ):
+        raise ToolError("timeout_s must be an integer from 1 to %s" % SHELL_TIMEOUT_MAX_S)
+    try:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", command],
+            cwd=os.fspath(start),
+            env=os.environ.copy(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        raise ToolError("could not start command: %s" % exc) from exc
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            _kill_process_group(proc)
+            stdout, stderr = _finish_timed_out(proc, exc)
+            partial = _clip(_shell_sections(stdout, stderr), MAX_SHELL_OUTPUT)
+            message = "shell timed out after %ss" % timeout_s
+            if partial:
+                message = "%s\n%s" % (message, partial)
+            raise ToolError(message) from exc
+        code = proc.returncode
+        if not isinstance(code, int):
+            raise ToolError("command did not exit")
+        return _shell_result(code, stdout or "", stderr or "")
+    finally:
+        _reap_shell(proc)
+
+
+def _shell_result(code: int, stdout: str, stderr: str) -> str:
+    body = _clip(_shell_sections(stdout, stderr), MAX_SHELL_OUTPUT)
+    if not body:
+        return "exit=%s" % code
+    return "exit=%s\n%s" % (code, body)
+
+
+def _shell_sections(stdout: str, stderr: str) -> str:
+    parts: list[str] = []
+    if stdout:
+        parts.append("stdout:\n%s" % stdout)
+    if stderr:
+        parts.append("stderr:\n%s" % stderr)
+    body = ""
+    for part in parts:
+        if body and not body.endswith("\n"):
+            body += "\n"
+        body += part
+    return body
+
+
+def _kill_process_group(proc: subprocess.Popen[str]) -> None:
+    """Kill the command's session. start_new_session makes its pid the process group id."""
+    pid = proc.pid
+    if not isinstance(pid, int) or pid <= 0:
+        return
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        proc.kill()
+        return
+    except OSError:
+        proc.kill()
+        return
+    # Only signal a group this child leads. A pid that is still in the daemon's
+    # group must not be passed to killpg.
+    if pgid != pid:
+        proc.kill()
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        proc.kill()
+    except OSError:
+        proc.kill()
+
+
+def _finish_timed_out(proc: subprocess.Popen[str], exc: subprocess.TimeoutExpired) -> tuple[str, str]:
+    try:
+        stdout, stderr = proc.communicate(timeout=_SHELL_DRAIN_S)
+    except subprocess.TimeoutExpired as drained:
+        stdout, stderr = _timeout_text(proc, drained)
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        return stdout, stderr
+    if stdout or stderr:
+        return stdout or "", stderr or ""
+    # communicate() can return empty strings after a timeout even when the first
+    # read already captured bytes. Fall back to that partial output.
+    return _timeout_text(proc, exc)
+
+
+def _timeout_text(proc: subprocess.Popen[str], exc: subprocess.TimeoutExpired) -> tuple[str, str]:
+    encoding = "utf-8"
+    errors = "replace"
+    stream = proc.stdout or proc.stderr
+    if stream is not None:
+        encoding = stream.encoding or encoding
+        errors = stream.errors or errors
+    return _as_text(exc.stdout, encoding, errors), _as_text(exc.stderr, encoding, errors)
+
+
+def _as_text(value: object, encoding: str, errors: str) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(encoding, errors)
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _reap_shell(proc: subprocess.Popen[str]) -> None:
+    try:
+        if proc.poll() is None:
+            _kill_process_group(proc)
+            try:
+                proc.communicate(timeout=_SHELL_DRAIN_S)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None and not stream.closed:
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 def _delete_path(workspace: Path, arguments: dict[str, Any]) -> str:
@@ -423,5 +621,6 @@ _FUNCS.update(
         "mkdir": _mkdir,
         "delete_path": _delete_path,
         "run_tests": _run_tests,
+        "shell": _shell,
     }
 )

@@ -9,6 +9,7 @@ const EVENT_TYPES = [
   "assistant.message",
   "assistant.delta",
   "assistant.reasoning",
+  "assistant.tool",
   "tool.pending",
   "tool.started",
   "tool.succeeded",
@@ -96,6 +97,12 @@ function parsedArgs(raw) {
 function argPath(raw) {
   const path = parsedArgs(raw).path;
   return typeof path === "string" ? path : "";
+}
+
+function streamingArgs(raw) {
+  const text = typeof raw === "string" ? raw : "";
+  if (!text) return "";
+  return text.length > 120 ? "\u2026" + text.slice(-117) : text;
 }
 
 function shortArgs(name, raw) {
@@ -218,24 +225,102 @@ function clearWaiting() {
   if (waiting) waiting.remove();
 }
 
-function appendDelta(text) {
-  const stick = nearBottom(transcriptEl);
+function ensureDraft() {
   clearWaiting();
   let bubble = document.getElementById("assistant-draft");
-  if (!bubble) bubble = addAssistant("", true);
-  bubble.textContent += text;
+  if (bubble) return bubble;
+  bubble = document.createElement("div");
+  bubble.id = "assistant-draft";
+  bubble.className = "bubble assistant draft";
+  const thinking = document.createElement("div");
+  thinking.className = "thinking";
+  thinking.textContent = "Thinking\u2026";
+  const answer = document.createElement("div");
+  answer.className = "answer";
+  bubble.append(thinking, answer);
+  const streaming = transcriptEl.querySelector(".tool-card.streaming");
+  if (streaming) transcriptEl.insertBefore(bubble, streaming);
+  else transcriptEl.appendChild(bubble);
+  return bubble;
+}
+
+function appendReasoning(text) {
+  if (!text) return;
+  const stick = nearBottom(transcriptEl);
+  const thinking = ensureDraft().querySelector(".thinking");
+  thinking.hidden = false;
+  if (thinking.dataset.live !== "1") {
+    thinking.dataset.live = "1";
+    thinking.textContent = "";
+    thinking.classList.add("live");
+  }
+  thinking.textContent += text;
   if (stick) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function appendDelta(text) {
+  if (!text) return;
+  const stick = nearBottom(transcriptEl);
+  const bubble = ensureDraft();
+  const thinking = bubble.querySelector(".thinking");
+  if (thinking && thinking.dataset.live !== "1") thinking.hidden = true;
+  bubble.querySelector(".answer").textContent += text;
+  if (stick) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function clearStreamingTools() {
+  for (const [key, state] of [...cardsBySlot.entries()]) {
+    if (!state.streaming) continue;
+    cardsBySlot.delete(key);
+    slotArgs.delete(key);
+    const node = document.getElementById("tool-slot-" + state.step + "-" + state.call_index);
+    if (node) node.remove();
+  }
+}
+
+function clearDraft() {
+  const draft = document.getElementById("assistant-draft");
+  if (draft) draft.remove();
+  clearStreamingTools();
 }
 
 function finalizeAssistant(text) {
   const stick = nearBottom(transcriptEl);
-  let bubble = document.getElementById("assistant-draft");
-  if (!text && !bubble) return;
+  const bubble = document.getElementById("assistant-draft");
+  if (!text) {
+    if (bubble) bubble.remove();
+    return;
+  }
   clearWaiting();
-  if (!bubble) bubble = addAssistant("", false);
-  bubble.id = "";
-  bubble.className = "bubble assistant";
-  bubble.textContent = text;
+  const node = bubble || addAssistant("", false);
+  node.id = "";
+  node.className = "bubble assistant";
+  node.textContent = text;
+  if (stick) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function appendToolDelta(step, index, nameChunk, argChunk) {
+  if (step == null || index == null || (!nameChunk && !argChunk)) return;
+  const stick = nearBottom(transcriptEl);
+  clearWaiting();
+  const key = slotKey(step, index);
+  let state = cardsBySlot.get(key);
+  if (state && !state.streaming) return;
+  if (!state) {
+    state = upsertCard({
+      step: step,
+      call_index: index,
+      name: nameChunk || "tool",
+      args: argChunk || "",
+      status: "pending",
+      streaming: true,
+    });
+  } else {
+    if (nameChunk) state.name = !state.name || state.name === "tool" ? nameChunk : state.name + nameChunk;
+    if (argChunk) state.args += argChunk;
+    paintCard(state);
+  }
+  slotArgs.set(key, { name: state.name, args: state.args });
   if (stick) transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
@@ -391,6 +476,7 @@ function mergeCard(state, partial) {
   if (typeof partial.replayed === "boolean") state.replayed = partial.replayed;
   if (typeof partial.duration_ms === "number") state.duration_ms = partial.duration_ms;
   if (typeof partial.result === "string" && partial.result) state.result = partial.result;
+  if (typeof partial.streaming === "boolean") state.streaming = partial.streaming;
 }
 
 function paintCard(state) {
@@ -420,9 +506,10 @@ function paintCard(state) {
   }
   node.id = state.op_id ? "tool-" + state.op_id : "tool-slot-" + state.step + "-" + state.call_index;
   node.dataset.status = state.status || "pending";
+  node.classList.toggle("streaming", Boolean(state.streaming));
   node.querySelector(".tool-name").textContent = state.name || "tool";
   node.querySelector(".tool-status").textContent = STATUS_ICON[state.status] || "○";
-  node.querySelector(".tool-args").textContent = shortArgs(state.name, state.args);
+  node.querySelector(".tool-args").textContent = state.streaming ? streamingArgs(state.args) : shortArgs(state.name, state.args);
   const meta = node.querySelector(".tool-meta");
   meta.replaceChildren();
   const bits = [];
@@ -561,6 +648,20 @@ function toolLabel(event) {
   return name + " · " + event.type.slice("tool.".length);
 }
 
+function timelineMark(event) {
+  if (event.type === "host.down") return "stop";
+  if (event.type === "host.replacing" || event.type === "host.replaced") return "restart";
+  if (event.type === "session.migrated") return "migrate";
+  return "";
+}
+
+function timelineText(event) {
+  if (event.type !== "session.migrated") return toolLabel(event);
+  const payload = event.payload || {};
+  const generation = payload.generation ? " g" + payload.generation : "";
+  return (payload.from || "?") + " → " + (payload.to || "?") + generation;
+}
+
 function escapeHtml(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -634,6 +735,16 @@ function addRequest(parent, toolName, raw) {
     }
     if (typeof args.old === "string") addBlock(parent, "Replace", args.old, "request");
     if (typeof args.new === "string") addBlock(parent, "With", args.new, "response");
+    return;
+  }
+  if (toolName === "shell" && typeof args.command === "string") {
+    if (typeof args.cwd === "string" && args.cwd && args.cwd !== ".") {
+      const cwd = document.createElement("p");
+      cwd.className = "traj-path";
+      cwd.textContent = args.cwd;
+      parent.appendChild(cwd);
+    }
+    addBlock(parent, "Command", args.command, "request");
     return;
   }
   if (typeof args.path === "string" && typeof args.content !== "string") {
@@ -711,7 +822,11 @@ function renderSnapshot(detail) {
     for (const call of list) upsertCard(cardFromRow(call));
   }
   if (!sawUser && detail.session.prompt) addUser(detail.session.prompt);
+  const hasAssistant = detail.messages.some((message) => message.role === "assistant");
   if (!transcriptEl.childElementCount) emptyNote(transcriptEl, "Waiting for the agent.");
+  else if (!hasAssistant && detail.session && !TERMINAL.has(detail.session.status)) {
+    emptyNote(transcriptEl, "Waiting for the agent.");
+  }
   rebuildChanged(detail.tool_calls);
   renderHeader(detail.session);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
@@ -734,17 +849,25 @@ function renderTimeline() {
   const stick = nearBottom(timelineEl);
   for (const event of rows) {
     const isTool = event.type.startsWith("tool.") && event.op_id;
+    const mark = timelineMark(event);
     const row = document.createElement(isTool ? "button" : "div");
     if (isTool) row.type = "button";
-    row.className = "tl-row" + (isTool ? " tool" : "") + (event.seq === openTimelineSeq ? " open" : "");
+    row.className = "tl-row" + (isTool ? " tool" : "") + (mark ? " mark-" + mark : "") + (event.seq === openTimelineSeq ? " open" : "");
     const main = document.createElement("div");
     main.className = "tl-main";
     const time = document.createElement("span");
     time.textContent = formatClock(event.ts);
     const type = document.createElement("span");
     type.className = "type";
-    type.textContent = toolLabel(event);
-    main.append(time, type);
+    type.textContent = timelineText(event);
+    main.appendChild(time);
+    if (mark) {
+      const badge = document.createElement("span");
+      badge.className = "tl-mark " + mark;
+      badge.textContent = mark;
+      main.appendChild(badge);
+    }
+    main.appendChild(type);
     row.appendChild(main);
     const extra = [event.host_id].filter(Boolean).join("  ");
     if (extra) {
@@ -830,6 +953,12 @@ function patchSession(event) {
 
 function applyTranscript(event) {
   const payload = event.payload || {};
+  if (event.type === "llm.started") {
+    const stick = nearBottom(transcriptEl);
+    ensureDraft();
+    if (stick) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    return;
+  }
   if (event.type === "assistant.message") {
     finalizeAssistant(payload.content || "");
     (payload.tool_calls || []).forEach((call, index) => {
@@ -840,6 +969,7 @@ function applyTranscript(event) {
         name: fn.name || "tool",
         args: fn.arguments || "",
         status: "pending",
+        streaming: false,
       });
       slotArgs.set(slotKey(payload.step, index), { name: fn.name || "tool", args: fn.arguments || "" });
       if (fn.name === "write_file") noteCode(fn.name, fn.arguments || "", "pending");
@@ -857,6 +987,7 @@ function applyTranscript(event) {
       call_index: payload.call_index,
       name: payload.name,
       status: "pending",
+      streaming: false,
     });
     const staged = slotArgs.get(slotKey(payload.step, payload.call_index)) || {};
     rememberTool(event.op_id, {
@@ -886,6 +1017,7 @@ function applyTranscript(event) {
     });
     noteChanged(state);
     noteCode(state.name, state.args, "succeeded");
+    if (state.name === "shell") refreshCodeFiles();
     rememberTool(event.op_id, {
       name: state.name,
       args: state.args,
@@ -921,20 +1053,18 @@ function applyTranscript(event) {
 function apply(event) {
   if (!event || !event.type) return;
   event.payload = event.payload || {};
-  if (event.type === "llm.retry") {
-    liveText = "";
-    liveReasoning = "";
-    const draft = document.getElementById("assistant-draft");
-    if (draft) draft.remove();
-  }
-  if (event.type === "assistant.delta" || event.type === "assistant.reasoning") {
+  if (event.type === "assistant.delta" || event.type === "assistant.reasoning" || event.type === "assistant.tool") {
     if (event.session_id === selected) {
-      const text = event.payload.text || "";
       if (event.type === "assistant.delta") {
+        const text = event.payload.text || "";
         appendDelta(text);
         liveText += text;
-      } else {
+      } else if (event.type === "assistant.reasoning") {
+        const text = event.payload.text || "";
+        appendReasoning(text);
         liveReasoning += text;
+      } else {
+        appendToolDelta(event.payload.step, event.payload.index, event.payload.name || "", event.payload.arguments || "");
       }
       if (trajectoryOpen) renderTrajectory();
     }
@@ -950,6 +1080,12 @@ function apply(event) {
     scheduleSessionRefresh();
   }
   if (!selected || (event.session_id && event.session_id !== selected)) return;
+  if (event.type === "llm.retry" && event.seq > floor) {
+    liveText = "";
+    liveReasoning = "";
+    clearDraft();
+    if (!transcriptEl.querySelector(":scope > .empty")) emptyNote(transcriptEl, "Waiting for the agent.");
+  }
   if (trajectoryOpen) renderTrajectory();
   if (event.seq <= floor) return;
   applyTranscript(event);
@@ -958,7 +1094,7 @@ function apply(event) {
 function listen(source, options) {
   const includeDeltas = !options || options.deltas !== false;
   for (const type of EVENT_TYPES) {
-    if ((type === "assistant.delta" || type === "assistant.reasoning") && !includeDeltas) continue;
+    if ((type === "assistant.delta" || type === "assistant.reasoning" || type === "assistant.tool") && !includeDeltas) continue;
     source.addEventListener(type, (message) => {
       try {
         apply(JSON.parse(message.data));
@@ -1141,6 +1277,7 @@ async function pollSupervisor() {
 let loadedImport = null;
 let liveOn = true;
 let openFile = "";
+let codeListToken = 0;
 const codeFiles = new Map();
 const unresolvedFiles = new Set();
 
@@ -1244,6 +1381,48 @@ async function refreshWorkspaceFile(path) {
   codeFiles.set(path, { text: body.content || "", status: "updated" });
   openFile = path;
   if (liveOn) renderCode();
+}
+
+function writeFileStillOwns(path) {
+  let open = false;
+  let done = false;
+  const consider = (state) => {
+    if (!state || state.name !== "write_file" || argPath(state.args) !== path) return;
+    if (state.status === "succeeded" || state.status === "failed") done = true;
+    else open = true;
+  };
+  for (const state of cardsBySlot.values()) consider(state);
+  for (const state of cards.values()) consider(state);
+  return open || !done;
+}
+
+async function refreshCodeFiles() {
+  const sessionId = selected;
+  if (!sessionId) return;
+  const token = ++codeListToken;
+  let response;
+  try {
+    response = await fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/files");
+  } catch (_err) {
+    return;
+  }
+  if (!response.ok || token !== codeListToken || selected !== sessionId) return;
+  let body;
+  try {
+    body = await response.json();
+  } catch (_err) {
+    return;
+  }
+  if (token !== codeListToken || selected !== sessionId) return;
+  for (const file of body.files || []) {
+    if (!file || typeof file.path !== "string" || !file.path) continue;
+    const content = file.content || "";
+    const current = codeFiles.get(file.path);
+    if (current && current.status === "writing" && writeFileStillOwns(file.path)) continue;
+    if (current && current.text === content) continue;
+    codeFiles.set(file.path, { text: content, status: "updated" });
+  }
+  if (liveOn && token === codeListToken && selected === sessionId) renderCode();
 }
 
 async function hydrateCode(detail) {
@@ -1600,8 +1779,8 @@ function hideTimeline() {
   const panel = document.getElementById("timeline-panel");
   if (panel) panel.hidden = true;
   const wrap = document.querySelector(".timeline-wrap");
-  const changed = document.querySelector(".changed-wrap");
-  if (wrap && changed && changed.parentElement) changed.parentElement.insertBefore(wrap, changed);
+  const system = document.querySelector(".col.system");
+  if (wrap && system) system.appendChild(wrap);
 }
 
 function hideTrajectory() {

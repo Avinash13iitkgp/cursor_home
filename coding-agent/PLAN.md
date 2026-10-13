@@ -209,6 +209,11 @@ CREATE INDEX IF NOT EXISTS events_session_seq ON events(session_id, seq);
 - `mkdir(path)` uses `exist_ok`.
 - `delete_path(path)` treats "already absent" as success.
 - `run_tests(target="workspace", path="tests", pattern="test*.py")` runs `python -m unittest discover`. `workspace` (the default) uses the session workspace, which is the base snapshot plus that session's edits. `baseline` runs a copy of `base/dummy-repo` so the suite shows failures that already exist in the unmodified snapshot, and the run does not write into that snapshot. A failing suite returns the output as a normal tool result. The same `op_id` replays the stored output.
+- `shell(command, cwd=".", timeout_s=30)` runs `/bin/sh -c` in the session workspace inside the daemon container.
+  - cwd is relative and confined to the workspace. The command itself is not allowlisted.
+  - timeout_s is 1..45, default 30. Timeout kills the process group.
+  - Non-zero exit returns `exit=<code>` plus clipped stdout/stderr as a normal tool result.
+  - Same op_id replays the journal and does not run again. A crash before the journal write can run the command twice.
 
 Paths are confined with `realpath(workspace / p)`, which must start with `realpath(workspace) + "/"`. Writes go through `fsutil.atomic_write`: write `path.tmp-<uuid>`, fsync, `os.replace`, fsync parent dir. No tool ever opens an existing file for in-place writing, and that is what makes the copy-on-write below correct.
 
@@ -442,5 +447,4 @@ Each step ends in something that runs. Time estimates add up to about 3 h 50 m.
 
 ## Out of scope for the prototype
 - Auth, multi-user isolation, remote hosts, S3, Redis gateway, and a separate scheduler service (all on the whiteboard; the backend does the scheduler's job in-process here).
-- A general shell in the daemon. `run_tests` runs the session workspace suite only and does not take a command.
 - Per-step snapshots and rollback, not needed given atomic writes and the op journal.

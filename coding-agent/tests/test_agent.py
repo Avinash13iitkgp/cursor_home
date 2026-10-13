@@ -191,6 +191,82 @@ def test_run_uses_one_host_and_records_the_tool_log(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_reasoning_and_tool_arguments_publish_before_commit(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, events, session_id = _claimed(tmp_path)
+        events.bind(asyncio.get_running_loop())
+        queue = events.subscribe()
+
+        class StreamingLlm:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.uncommitted = False
+
+            async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Any:
+                del messages, tools
+                self.calls += 1
+                if self.calls == 1:
+                    yield StreamEvent(kind="reasoning", text="Look at the file. ")
+                    yield StreamEvent(kind="tool", index=0, name="read_file")
+                    yield StreamEvent(kind="tool", index=0, arguments='{"path":"README.md"}')
+                    stored = [event.type for event in store.events_after(session_id, 0)]
+                    self.uncommitted = (
+                        "assistant.message" not in stored
+                        and "assistant.tool" not in stored
+                        and "assistant.reasoning" not in stored
+                    )
+                    yield StreamEvent(
+                        kind="done",
+                        turn=AssistantTurn(
+                            "",
+                            [ModelToolCall("c1", "read_file", '{"path":"README.md"}')],
+                            reasoning="Look at the file. ",
+                        ),
+                    )
+                    return
+                yield StreamEvent(kind="reasoning", text="Done thinking. ")
+                yield StreamEvent(kind="text", text="done")
+                yield StreamEvent(kind="done", turn=AssistantTurn("done", [], reasoning="Done thinking. "))
+
+        llm = StreamingLlm()
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        agent = Agent(store, events, FakeScheduler(), llm, "owner-a", sleeper=no_sleep)
+        await agent.run(session_id)
+        await asyncio.sleep(0)
+        assert llm.uncommitted
+        assert llm.calls == 2
+        seen = []
+        while not queue.empty():
+            seen.append(queue.get_nowait())
+        first_message = next(index for index, event in enumerate(seen) if event.type == "assistant.message")
+        reasoning = [event for event in seen if event.type == "assistant.reasoning"]
+        tool_events = [event for event in seen if event.type == "assistant.tool"]
+        assert reasoning[0].ephemeral is True
+        assert reasoning[0].payload == {"text": "Look at the file. ", "step": 0}
+        assert seen.index(reasoning[0]) < first_message
+        name_event = next(event for event in tool_events if event.payload.get("name") == "read_file")
+        arg_event = next(event for event in tool_events if event.payload.get("arguments"))
+        assert name_event.ephemeral is True
+        assert arg_event.ephemeral is True
+        assert arg_event.payload["index"] == 0
+        assert arg_event.payload["arguments"] == '{"path":"README.md"}'
+        assert arg_event.payload["step"] == 0
+        assert seen.index(name_event) < first_message
+        assert seen.index(arg_event) < first_message
+        stored = [event.type for event in store.events_after(session_id, 0)]
+        assert "assistant.reasoning" not in stored
+        assert "assistant.tool" not in stored
+        assert "assistant.delta" not in stored
+        assert "assistant.message" in stored
+        assert store.get_session(session_id).status == "completed"
+        store.close()
+
+    asyncio.run(scenario())
+
+
 def test_resume_retries_the_same_op_without_a_second_model_call_first(tmp_path: Path) -> None:
     async def scenario() -> None:
         store, events, session_id = _claimed(tmp_path)

@@ -4,12 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Coding agent</title>
-  <link rel="stylesheet" href="/styles.css?v=2">
+  <link rel="stylesheet" href="/styles.css?v=4">
 </head>
 <body>
   <header class="topbar">
     <h1>Coding agent</h1>
     <span id="connection" class="pill" data-state="reconnecting" aria-live="polite">reconnecting (0)</span>
+    <div class="hosts-wrap">
+      <h2>Hosts</h2>
+      <div id="hosts" class="hosts"></div>
+    </div>
     <span id="supervisor" class="supervisor">supervisor …</span>
     <button type="button" id="kill-backend" class="danger">Kill backend</button>
   </header>
@@ -69,16 +73,16 @@
         </div>
       </section>
       <div id="transcript" class="transcript"></div>
+      <div class="changed-wrap">
+        <h2>Changed files</h2>
+        <div id="changed" class="changed"></div>
+      </div>
       <section id="final" class="final" hidden>
         <h3>Final answer</h3>
         <p></p>
       </section>
     </section>
-    <section class="col system" aria-label="System">
-      <div class="hosts-wrap">
-        <h2>Hosts</h2>
-        <div id="hosts" class="hosts"></div>
-      </div>
+    <section class="col system" aria-label="Timeline">
       <div class="timeline-wrap">
         <div class="section-head">
           <h2>Timeline</h2>
@@ -91,10 +95,6 @@
           <pre id="timeline-detail-response"></pre>
         </div>
         <div id="timeline" class="timeline"></div>
-      </div>
-      <div class="changed-wrap">
-        <h2>Changed files</h2>
-        <div id="changed" class="changed"></div>
       </div>
     </section>
   </main>
@@ -131,6 +131,6 @@
     </header>
     <div id="timeline-panel-body" class="trajectory-body"></div>
   </section>
-  <script src="/app.js"></script>
+  <script src="/app.js?v=4"></script>
 </body>
 </html>

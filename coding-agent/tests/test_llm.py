@@ -109,6 +109,65 @@ def test_client_streams_and_hides_the_key(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_reasoning_and_tool_arguments_emit_before_the_turn(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        lines = "\n".join(
+            [
+                "data: " + json.dumps({"choices": [{"delta": {"reasoning_content": "Look at the file. "}}]}),
+                "data: " + json.dumps({"choices": [{"delta": {"content": "Hello"}}]}),
+                "data: "
+                + json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "tool_calls": [
+                                        {"index": 0, "id": "call_1", "function": {"name": "read_file", "arguments": ""}}
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                ),
+                "data: " + json.dumps({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1b"}]}}]}),
+                "data: " + json.dumps({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"path":'}}]}}]}),
+                "data: " + json.dumps({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": ' "a.py"}'}}]}}]}),
+                "data: [DONE]",
+                "",
+            ]
+        )
+        return httpx.Response(200, text=lines)
+
+    async def scenario() -> None:
+        client = GrokClient(_settings(tmp_path), httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        events = []
+        try:
+            async for event in client.chat(
+                [{"role": "user", "content": "go"}],
+                [{"type": "function", "function": {"name": "read_file"}}],
+            ):
+                events.append(event)
+        finally:
+            await client.aclose()
+        assert events[-1].kind == "done"
+        assert events[-1].turn is not None
+        earlier = events[:-1]
+        assert [event.kind for event in earlier] == ["reasoning", "text", "tool", "tool", "tool"]
+        assert earlier[0].text == "Look at the file. "
+        assert earlier[1].text == "Hello"
+        assert earlier[2].index == 0
+        assert earlier[2].name == "read_file"
+        assert earlier[2].arguments == ""
+        assert earlier[3].arguments == '{"path":'
+        assert earlier[4].arguments == ' "a.py"}'
+        assert events[-1].turn.reasoning == "Look at the file. "
+        assert events[-1].turn.tool_calls[0].name == "read_file"
+        assert json.loads(events[-1].turn.tool_calls[0].arguments) == {"path": "a.py"}
+
+    asyncio.run(scenario())
+
+
 def test_retryable_and_fatal_status_codes(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         status = 503 if request.url.path.endswith("/first") else 401

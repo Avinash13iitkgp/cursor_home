@@ -219,6 +219,18 @@ class Agent:
                 self.events.emit_ephemeral(session_id, "assistant.reasoning", {"text": event.text, "step": step})
             elif event.kind == "text" and event.text:
                 self.events.emit_ephemeral(session_id, "assistant.delta", {"text": event.text, "step": step})
+            elif event.kind == "tool" and (event.name or event.arguments):
+                # Live subscribers only. A dropped stream never becomes a tool_calls row.
+                self.events.emit_ephemeral(
+                    session_id,
+                    "assistant.tool",
+                    {
+                        "step": step,
+                        "index": event.index,
+                        "name": event.name,
+                        "arguments": event.arguments,
+                    },
+                )
             elif event.kind == "done" and event.turn is not None:
                 turn = event.turn
         if turn is None:
