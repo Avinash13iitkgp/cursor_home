@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Coding agent</title>
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/styles.css?v=2">
 </head>
 <body>
   <header class="topbar">
@@ -56,6 +56,7 @@
           <button type="button" id="commit" disabled>Commit</button>
           <button type="button" id="revert" disabled>Revert</button>
           <a id="trajectory" class="action" href="/sessions/" aria-pressed="false" aria-disabled="true">Trajectory</a>
+          <a id="timeline-open" class="action" href="/sessions/" target="_blank" rel="noopener" aria-pressed="false" aria-disabled="true">Timeline</a>
           <button type="button" id="cancel" disabled>Cancel</button>
         </div>
       </header>
@@ -74,7 +75,7 @@
       </section>
     </section>
     <section class="col system" aria-label="System">
-      <div>
+      <div class="hosts-wrap">
         <h2>Hosts</h2>
         <div id="hosts" class="hosts"></div>
       </div>
@@ -91,7 +92,7 @@
         </div>
         <div id="timeline" class="timeline"></div>
       </div>
-      <div>
+      <div class="changed-wrap">
         <h2>Changed files</h2>
         <div id="changed" class="changed"></div>
       </div>
@@ -119,6 +120,16 @@
       <button type="button" id="trajectory-close">Close</button>
     </header>
     <div id="trajectory-body" class="trajectory-body"></div>
+  </section>
+  <section id="timeline-panel" class="trajectory" hidden>
+    <header class="trajectory-bar">
+      <div>
+        <h2 id="timeline-title">Timeline</h2>
+        <a id="timeline-page-link" href=""></a>
+      </div>
+      <button type="button" id="timeline-close">Close</button>
+    </header>
+    <div id="timeline-panel-body" class="trajectory-body"></div>
   </section>
   <script src="/app.js"></script>
 </body>

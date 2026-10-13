@@ -335,19 +335,49 @@ def test_kill_keeps_the_host_down_for_20_seconds(tmp_path: Path) -> None:
         session = store.create_session(prompt="task", max_steps=4, system_prompt="s", idempotency_key="k")
         store.claim_sessions("owner-a", 1, 10)
         store.assign_host("owner-a", session.session_id, "host-a", 1)
-        client.push("http://127.0.0.1:7701", Health("host-a", "boot-2", True, 0.1))
+        endpoint = "http://127.0.0.1:7701"
         before = clock.now
         await scheduler.abandon_host("host-a")
         assert clock.now == before
-        assert store.get_host("host-a").status == "down"
-        assert docker.commands == []
+        assert store.get_host("host-a").status == "healthy"
+        assert store.get_session(session.session_id).host_id == "host-a"
+        for _ in range(3):
+            clock.now += scheduler.settings.health_interval_s
+            client.push(endpoint, DaemonError("down"))
+            await scheduler.observe(store.get_host("host-a"))
+        assert clock.now == before + 6
         assert store.get_session(session.session_id).host_id == "host-b"
+        assert docker.runs == 0
+        client.push(endpoint, Health("host-a", "boot-2", True, 0.1))
         await asyncio.gather(*scheduler._recovery)
         assert clock.now >= before + 20
         assert store.get_host("host-a").status == "healthy"
         assert store.get_host("host-a").generation == 2
         assert ("rm", "coding-agent-host-a") in docker.commands
         assert store.get_session(session.session_id).host_id == "host-b"
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_session_returns_when_the_other_host_is_running_again(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, _client, _docker, scheduler, _clock = _world(tmp_path)
+        store.record_health_success("host-a", "boot-a")
+        store.record_health_success("host-b", "boot-b")
+        session = store.create_session(prompt="task", max_steps=4, system_prompt="s", idempotency_key="k")
+        store.claim_sessions("owner-a", 1, 10)
+        store.assign_host("owner-a", session.session_id, "host-a", 1)
+        store.force_down("host-a")
+        scheduler._move_sessions("host-a")
+        assert store.get_session(session.session_id).host_id == "host-b"
+        store.force_down("host-b")
+        scheduler._rehome_stranded_sessions()
+        assert store.get_session(session.session_id).host_id == "host-b"
+        store.mark_replacing("host-a")
+        store.mark_replaced("host-a", "boot-a2")
+        scheduler._rehome_stranded_sessions()
+        assert store.get_session(session.session_id).host_id == "host-a"
         store.close()
 
     asyncio.run(scenario())

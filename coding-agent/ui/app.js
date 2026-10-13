@@ -275,9 +275,8 @@ function renderHeader(session) {
     cancel.disabled = true;
     document.getElementById("live-code").disabled = true;
     document.getElementById("commit").disabled = true;
-    const trajectory = document.getElementById("trajectory");
-    trajectory.setAttribute("aria-disabled", "true");
-    trajectory.href = "/sessions/";
+    setPageLink("trajectory", "");
+    setPageLink("timeline-open", "");
     showFinal({ status: "" });
     return;
   }
@@ -296,9 +295,8 @@ function renderHeader(session) {
   cancel.disabled = TERMINAL.has(session.status);
   document.getElementById("live-code").disabled = false;
   document.getElementById("commit").disabled = false;
-  const trajectory = document.getElementById("trajectory");
-  trajectory.removeAttribute("aria-disabled");
-  trajectory.href = trajectoryUrl(session.session_id);
+  setPageLink("trajectory", trajectoryUrl(session.session_id));
+  setPageLink("timeline-open", timelineUrl(session.session_id));
   showFinal(session);
 }
 
@@ -1544,12 +1542,29 @@ function trajectoryUrl(sessionId) {
   return "/sessions/" + encodeURIComponent(sessionId) + "/trajectory";
 }
 
-function trajectoryIdFromPath() {
-  const match = location.pathname.match(/^\/sessions\/([^/]+)\/trajectory\/?$/);
-  return match ? decodeURIComponent(match[1]) : "";
+function timelineUrl(sessionId) {
+  return "/sessions/" + encodeURIComponent(sessionId) + "/timeline";
+}
+
+function setPageLink(id, url) {
+  const node = document.getElementById(id);
+  if (!url) {
+    node.setAttribute("aria-disabled", "true");
+    node.href = "/sessions/";
+    return;
+  }
+  node.removeAttribute("aria-disabled");
+  node.href = url;
+}
+
+function pageView() {
+  const match = location.pathname.match(/^\/sessions\/([^/]+)\/(trajectory|timeline)\/?$/);
+  if (!match) return { kind: "", id: "" };
+  return { kind: match[2], id: decodeURIComponent(match[1]) };
 }
 
 function showTrajectory() {
+  hideTimeline();
   trajectoryOpen = true;
   document.getElementById("trajectory").setAttribute("aria-pressed", "true");
   document.getElementById("trajectory-panel").hidden = false;
@@ -1557,6 +1572,36 @@ function showTrajectory() {
   link.href = location.origin + trajectoryUrl(selected);
   link.textContent = link.href;
   renderTrajectory();
+}
+
+let timelineOpen = false;
+
+function showTimeline() {
+  if (trajectoryOpen) hideTrajectory();
+  timelineOpen = true;
+  document.getElementById("timeline-open").setAttribute("aria-pressed", "true");
+  const panel = document.getElementById("timeline-panel");
+  panel.hidden = false;
+  document.getElementById("timeline-panel-body").appendChild(document.querySelector(".timeline-wrap"));
+  const session = sessions.find((item) => item.session_id === selected);
+  document.getElementById("timeline-title").textContent = session
+    ? "Timeline · " + (session.title || session.session_id)
+    : "Timeline";
+  const link = document.getElementById("timeline-page-link");
+  link.href = location.origin + timelineUrl(selected);
+  link.textContent = link.href;
+  renderTimeline();
+}
+
+function hideTimeline() {
+  timelineOpen = false;
+  const open = document.getElementById("timeline-open");
+  if (open) open.setAttribute("aria-pressed", "false");
+  const panel = document.getElementById("timeline-panel");
+  if (panel) panel.hidden = true;
+  const wrap = document.querySelector(".timeline-wrap");
+  const changed = document.querySelector(".changed-wrap");
+  if (wrap && changed && changed.parentElement) changed.parentElement.insertBefore(wrap, changed);
 }
 
 function hideTrajectory() {
@@ -1746,10 +1791,14 @@ async function selectSession(id) {
   const token = ++selectToken;
   closeSessionStream();
   selected = id;
-  const pathId = trajectoryIdFromPath();
-  if (pathId && pathId !== id) hideTrajectory();
-  if (!pathId || pathId !== id) {
-    if (location.hash !== "#" + id || location.pathname !== "/") history.replaceState(null, "", "/#" + id);
+  const view = pageView();
+  if (view.id && view.id !== id) {
+    if (view.kind === "trajectory") hideTrajectory();
+    if (view.kind === "timeline") hideTimeline();
+  }
+  const stay = view.id === id && (view.kind === "trajectory" || view.kind === "timeline");
+  if (!stay && (location.hash !== "#" + id || location.pathname !== "/")) {
+    history.replaceState(null, "", "/#" + id);
   }
   renderSessionList();
   renderBanners();
@@ -1927,7 +1976,14 @@ document.getElementById("commit-llm").addEventListener("click", resolveCommit);
 document.getElementById("trajectory").addEventListener("click", (event) => {
   if (event.currentTarget.getAttribute("aria-disabled") === "true") event.preventDefault();
 });
+document.getElementById("timeline-open").addEventListener("click", (event) => {
+  if (event.currentTarget.getAttribute("aria-disabled") === "true") event.preventDefault();
+});
 document.getElementById("trajectory-close").addEventListener("click", () => {
+  if (selected) location.href = "/#" + selected;
+  else location.href = "/";
+});
+document.getElementById("timeline-close").addEventListener("click", () => {
   if (selected) location.href = "/#" + selected;
   else location.href = "/";
 });
@@ -1968,11 +2024,13 @@ renderTimeline();
 renderHosts();
 openGlobalStream();
 refreshSessions().then(async () => {
-  const pathId = trajectoryIdFromPath();
-  const id = pathId || location.hash.replace(/^#/, "");
+  const view = pageView();
+  const id = view.id || location.hash.replace(/^#/, "");
   if (!id) return;
   await selectSession(id);
-  if (pathId && pathId === selected) showTrajectory();
+  if (view.id !== selected) return;
+  if (view.kind === "trajectory") showTrajectory();
+  if (view.kind === "timeline") showTimeline();
 });
 refreshHosts();
 refreshHistory();

@@ -479,6 +479,7 @@ def create_app(
         return {"text": path.read_text(encoding="utf-8")}
 
     @app.get("/sessions/{session_id}/trajectory")
+    @app.get("/sessions/{session_id}/timeline")
     async def trajectory_page(session_id: str) -> FileResponse:
         page = settings.root / "ui" / "index.html"
         if not page.is_file():

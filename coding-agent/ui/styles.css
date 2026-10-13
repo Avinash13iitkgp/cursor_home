@@ -120,7 +120,7 @@ h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spa
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr) 340px;
+  grid-template-columns: 280px minmax(0, 1fr) minmax(420px, 34vw);
 }
 
 .col {
@@ -228,7 +228,7 @@ textarea {
   font-size: 12px;
 }
 
-#live-code[aria-pressed="true"], #trajectory[aria-pressed="true"] {
+#live-code[aria-pressed="true"], #trajectory[aria-pressed="true"], #timeline-open[aria-pressed="true"] {
   border-color: var(--accent);
   color: var(--accent);
 }
@@ -297,6 +297,17 @@ textarea {
 }
 
 .trajectory-body { flex: 1; overflow: auto; padding: 12px 14px; }
+
+#timeline-panel-body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#timeline-panel-body .timeline-wrap { flex: 1; min-height: 0; }
+#timeline-panel .timeline { font-size: 14px; }
+#timeline-panel .tl-row { padding: 8px 2px; }
+#timeline-panel .timeline-detail { max-height: 40vh; }
 
 .step-card {
   border: 1px solid var(--line);
@@ -682,8 +693,20 @@ textarea {
 
 .host-card button { margin-top: 8px; }
 
+.hosts-wrap {
+  flex: 0 0 auto;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.changed-wrap {
+  flex: 0 0 auto;
+  max-height: 120px;
+  overflow: auto;
+}
+
 .timeline-wrap {
-  flex: 1;
+  flex: 1 1 auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -700,10 +723,11 @@ textarea {
 
 .timeline {
   flex: 1;
+  min-height: 0;
   overflow: auto;
   margin-top: 8px;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .tl-row {

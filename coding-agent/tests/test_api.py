@@ -213,6 +213,9 @@ def test_trajectory_page_is_its_own_url(tmp_path: Path) -> None:
         response = client.get("/sessions/s_abc/trajectory")
         assert response.status_code == 200
         assert "Coding agent" in response.text
+        timeline = client.get("/sessions/s_abc/timeline")
+        assert timeline.status_code == 200
+        assert "Coding agent" in timeline.text
     store.close()
 
 

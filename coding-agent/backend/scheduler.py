@@ -54,6 +54,7 @@ class Scheduler:
         self._monotonic = monotonic
         self._replacing: set[str] = set()
         self._down_until: dict[str, float] = {}
+        self._switch_after: dict[str, float] = {}
         self._recovery: set[asyncio.Task[None]] = set()
         self._stop = False
         self._tools: list[dict[str, Any]] | None = None
@@ -93,10 +94,11 @@ class Scheduler:
                 if action == "replace":
                     self._move_sessions(host.host_id)
                     self._schedule_replace(host.host_id)
+            self._rehome_stranded_sessions()
             await self._sleep(self.settings.health_interval_s)
 
     async def observe(self, host: Host) -> str:
-        if host.host_id in self._replacing or host.status == "replacing" or self._held_down(host.host_id):
+        if host.host_id in self._replacing or host.status == "replacing":
             return "busy"
         if host.status == "down":
             return "replace"
@@ -105,6 +107,7 @@ class Scheduler:
         except DaemonError:
             health = None
         if health is not None:
+            self._switch_after.pop(host.host_id, None)
             self.store.record_health_success(host.host_id, health.boot_id)
             return "healthy"
         return self._note_failure(host.host_id)
@@ -139,14 +142,17 @@ class Scheduler:
             return
         self._note_failure(host_id)
 
+    def _switch_ready(self, host_id: str) -> bool:
+        ready_at = self._switch_after.get(host_id)
+        if ready_at is None:
+            return True
+        return self._monotonic() >= ready_at
+
     async def abandon_host(self, host_id: str) -> None:
-        """A killed host stays down. Its container cannot be started again for 20s."""
+        """Start the clocks. The session moves after 3 heartbeats, not on the click."""
         self._arm_restart_hold(host_id)
-        if self.store.get_host(host_id).status != "down":
-            self.store.force_down(host_id)
-            logger.info("host %s down", host_id)
-        self._move_sessions(host_id)
-        self._schedule_replace(host_id)
+        wait = self.settings.health_fail_threshold * float(self.settings.health_interval_s)
+        self._switch_after[host_id] = self._monotonic() + wait
 
     def _schedule_replace(self, host_id: str, delay_s: float = 0) -> None:
         del delay_s
@@ -158,14 +164,29 @@ class Scheduler:
         task.add_done_callback(self._recovery.discard)
 
     def _peer(self, host_id: str | None) -> Host | None:
-        healthy = [host for host in self.store.list_hosts() if host.status == "healthy" and host.host_id != host_id]
+        healthy = [
+            host
+            for host in self.store.list_hosts()
+            if host.host_id != host_id and host.status == "healthy" and not self._held_down(host.host_id)
+        ]
         if not healthy:
             return None
         counts = self.store.active_counts()
         healthy.sort(key=lambda host: (counts.get(host.host_id, 0), host.host_id))
         return healthy[0]
 
+    def _rehome_stranded_sessions(self) -> None:
+        """A session left on a dead host moves as soon as some other host is healthy."""
+        for host in self.store.list_hosts():
+            if host.status == "suspect":
+                continue
+            if host.status == "healthy" and not self._held_down(host.host_id):
+                continue
+            self._move_sessions(host.host_id)
+
     def _move_sessions(self, host_id: str) -> None:
+        if not self._switch_ready(host_id):
+            return
         peer = self._peer(host_id)
         if peer is None:
             return
@@ -201,6 +222,8 @@ class Scheduler:
                 if health is not None and health.boot_id and health.boot_id != previous_boot:
                     replaced = self.store.mark_replaced(host_id, health.boot_id)
                     logger.info("host %s replaced generation %s", host_id, replaced.generation)
+                    self._down_until.pop(host_id, None)
+                    self._rehome_stranded_sessions()
                     return
                 await self._sleep(0.5)
             self.store.force_down(host_id)
@@ -216,10 +239,19 @@ class Scheduler:
             if session.status in ("completed", "failed", "cancelled") or session.lease_owner != self.owner:
                 raise LeaseLost(session_id)
             assigned = self.store.get_host(session.host_id) if session.host_id else None
-            if assigned is not None and assigned.status == "healthy":
+            assigned_ok = (
+                assigned is not None
+                and assigned.status == "healthy"
+                and not self._held_down(assigned.host_id)
+            )
+            if assigned_ok:
                 self.store.assign_host(self.owner, session_id, assigned.host_id, assigned.generation)
                 return HostAssignment(assigned.host_id, assigned.endpoint, assigned.generation)
-            if assigned is None or assigned.status == "down":
+            # Down or replacing: leave after the heartbeat window, once another host can take the work.
+            if assigned is None or assigned.status != "suspect":
+                if session.host_id and not self._switch_ready(session.host_id):
+                    await self._sleep(0.2)
+                    continue
                 peer = self._peer(session.host_id)
                 if peer is not None:
                     self.store.migrate_host(self.owner, session_id, peer.host_id, peer.generation)
