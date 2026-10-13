@@ -286,7 +286,7 @@ class Store:
         now = time.time()
         with self._tx() as conn:
             row = conn.execute("SELECT * FROM hosts WHERE host_id=?", (host_id,)).fetchone()
-            if row is None or row["status"] in ("down", "replacing"):
+            if row is None or row["status"] == "down":
                 return
             conn.execute(
                 "UPDATE hosts SET status='down', consecutive_failures=?, updated_at=? WHERE host_id=?",

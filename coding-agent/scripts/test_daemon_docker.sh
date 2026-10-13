@@ -45,6 +45,9 @@ post() {
 }
 
 say "build and start host-a and host-b"
+# Failover starts a container with `docker run --name`. Compose does not own that
+# container, so the next `compose up` hits a name conflict unless it is removed.
+docker rm -f coding-agent-host-a coding-agent-host-b >/dev/null 2>&1 || true
 docker compose up -d --build
 wait_health "$HOST_A"
 wait_health "$HOST_B"
