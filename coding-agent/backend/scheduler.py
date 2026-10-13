@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 Sleeper = Callable[[float], Awaitable[None]]
 Clock = Callable[[], float]
 REPLACE_TIMEOUT_S = 30.0
+RESTART_DELAY_S = 20.0
 
 
 class HostUnreachable(Exception):
@@ -52,9 +53,17 @@ class Scheduler:
         self._sleep = sleeper
         self._monotonic = monotonic
         self._replacing: set[str] = set()
+        self._down_until: dict[str, float] = {}
         self._recovery: set[asyncio.Task[None]] = set()
         self._stop = False
         self._tools: list[dict[str, Any]] | None = None
+
+    def _restart_delay(self) -> float:
+        return max(RESTART_DELAY_S, float(self.settings.migrate_after_s))
+
+    def _held_down(self, host_id: str) -> bool:
+        until = self._down_until.get(host_id)
+        return until is not None and self._monotonic() < until
 
     def pick_host(self) -> Host | None:
         healthy = [host for host in self.store.list_hosts() if host.status == "healthy"]
@@ -69,13 +78,12 @@ class Scheduler:
             for host in self.store.list_hosts():
                 action = await self.observe(host)
                 if action == "replace":
-                    task = asyncio.create_task(self.replace_host(host.host_id))
-                    self._recovery.add(task)
-                    task.add_done_callback(self._recovery.discard)
+                    self._move_sessions(host.host_id)
+                    self._schedule_replace(host.host_id, self._restart_delay())
             await self._sleep(self.settings.health_interval_s)
 
     async def observe(self, host: Host) -> str:
-        if host.host_id in self._replacing or host.status == "replacing":
+        if host.host_id in self._replacing or host.status == "replacing" or self._held_down(host.host_id):
             return "busy"
         if host.status == "down":
             return "replace"
@@ -86,14 +94,27 @@ class Scheduler:
         if health is not None:
             self.store.record_health_success(host.host_id, health.boot_id)
             return "healthy"
-        outcome = self.store.record_health_failure(host.host_id, self.settings.health_fail_threshold)
-        if outcome == "down":
-            logger.info("host %s down", host.host_id)
+        return self._note_failure(host.host_id)
+
+    def _note_failure(self, host_id: str) -> str:
+        """Count one missed heartbeat. Move sessions only after the threshold."""
+        host = self.store.get_host(host_id)
+        if host.status == "down":
             return "replace"
-        return outcome
+        if host.status == "replacing":
+            return "replacing"
+        outcome = self.store.record_health_failure(host_id, self.settings.health_fail_threshold)
+        if outcome != "down":
+            return outcome
+        logger.info("host %s down", host_id)
+        self._move_sessions(host_id)
+        self._schedule_replace(host_id, self._restart_delay())
+        return "replace"
 
     async def report_failure(self, host_id: str) -> None:
         """Probe immediately after a tool call could not reach the daemon."""
+        if self._held_down(host_id):
+            return
         host = self.store.get_host(host_id)
         try:
             health = await self.client.health(host.endpoint, self.settings.health_timeout_s)
@@ -102,15 +123,54 @@ class Scheduler:
         if health is not None:
             self.store.record_health_success(host_id, health.boot_id)
             return
-        self.store.force_down(host_id)
-        logger.info("host %s down", host_id)
-        await self.replace_host(host_id)
+        self._note_failure(host_id)
 
-    async def replace_host(self, host_id: str) -> None:
+    async def abandon_host(self, host_id: str) -> None:
+        """A killed host stays down, and its replacement waits out the restart delay."""
+        delay = self._restart_delay()
+        self._down_until[host_id] = self._monotonic() + delay
+        if self.store.get_host(host_id).status != "down":
+            self.store.force_down(host_id)
+            logger.info("host %s down", host_id)
+        self._move_sessions(host_id)
+        self._schedule_replace(host_id, delay)
+
+    def _schedule_replace(self, host_id: str, delay_s: float = 0) -> None:
+        if host_id in self._replacing:
+            return
+        task = asyncio.create_task(self.replace_host(host_id, delay_s=delay_s))
+        self._recovery.add(task)
+        task.add_done_callback(self._recovery.discard)
+
+    def _peer(self, host_id: str | None) -> Host | None:
+        healthy = [host for host in self.store.list_hosts() if host.status == "healthy" and host.host_id != host_id]
+        if not healthy:
+            return None
+        counts = self.store.active_counts()
+        healthy.sort(key=lambda host: (counts.get(host.host_id, 0), host.host_id))
+        return healthy[0]
+
+    def _move_sessions(self, host_id: str) -> None:
+        peer = self._peer(host_id)
+        if peer is None:
+            return
+        for session in self.store.list_sessions():
+            if session.host_id != host_id or session.status not in ("queued", "running", "waiting_host"):
+                continue
+            try:
+                self.store.migrate_host(self.owner, session.session_id, peer.host_id, peer.generation)
+            except LeaseLost:
+                continue
+            logger.info("session %s migrated %s -> %s", session.session_id, host_id, peer.host_id)
+
+    async def replace_host(self, host_id: str, delay_s: float = 0) -> None:
         if host_id in self._replacing:
             return
         self._replacing.add(host_id)
         try:
+            if delay_s > 0:
+                logger.info("host %s staying down for %.0fs", host_id, delay_s)
+                await self._sleep(delay_s)
             host = self.store.get_host(host_id)
             previous_boot = host.boot_id or ""
             self.store.mark_replacing(host_id)
@@ -132,25 +192,24 @@ class Scheduler:
             logger.info("host %s down", host_id)
         finally:
             self._replacing.discard(host_id)
+            self._down_until.pop(host_id, None)
 
     async def wait_for_host(self, session_id: str) -> HostAssignment:
-        """Return this session's host once it is healthy, or move the session after the deadline."""
-        started = self._monotonic()
+        """Stay through a short miss. Move only after the host is down."""
         while True:
             session = self.store.get_session(session_id)
             if session.status in ("completed", "failed", "cancelled") or session.lease_owner != self.owner:
                 raise LeaseLost(session_id)
-            if session.host_id:
-                host = self.store.get_host(session.host_id)
-                if host.status == "healthy":
-                    self.store.assign_host(self.owner, session_id, host.host_id, host.generation)
-                    return HostAssignment(host.host_id, host.endpoint, host.generation)
-            if self._monotonic() - started >= self.settings.migrate_after_s:
-                other = self.pick_host()
-                if other is not None and other.host_id != session.host_id:
-                    self.store.migrate_host(self.owner, session_id, other.host_id, other.generation)
-                    logger.info("session %s migrated %s -> %s", session_id, session.host_id, other.host_id)
-                    return HostAssignment(other.host_id, other.endpoint, other.generation)
+            assigned = self.store.get_host(session.host_id) if session.host_id else None
+            if assigned is not None and assigned.status == "healthy":
+                self.store.assign_host(self.owner, session_id, assigned.host_id, assigned.generation)
+                return HostAssignment(assigned.host_id, assigned.endpoint, assigned.generation)
+            if assigned is None or assigned.status == "down":
+                peer = self._peer(session.host_id)
+                if peer is not None:
+                    self.store.migrate_host(self.owner, session_id, peer.host_id, peer.generation)
+                    logger.info("session %s migrated %s -> %s", session_id, session.host_id, peer.host_id)
+                    return HostAssignment(peer.host_id, peer.endpoint, peer.generation)
             await self._sleep(0.2)
 
     async def prepare(self, session_id: str) -> HostAssignment:

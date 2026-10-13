@@ -11,6 +11,7 @@ from backend.imports import (
     import_tree,
     list_workspace_files,
     load_import,
+    materialize_empty,
     materialize_import,
     read_workspace_file,
     save_import,
@@ -38,6 +39,17 @@ def test_import_is_materialized_and_kept_by_ensure(tmp_path: Path) -> None:
     assert read_workspace_file(cow, "s_loaded", "pkg/hello.py") == "print('loaded')\n"
     with pytest.raises(ImportError):
         read_workspace_file(cow, "s_loaded", "../secret")
+
+
+def test_empty_workspace_is_not_replaced_by_the_dummy_repo(tmp_path: Path) -> None:
+    cow = tmp_path / "cow"
+    seed_base(cow, DUMMY)
+    materialize_empty(cow, "s_new")
+    ensured = ensure_session(cow, "s_new")
+    assert ensured.created is False
+    assert list(ensured.path.iterdir()) == []
+    assert not (ensured.path / "TASK.md").exists()
+    assert not (ensured.path / "inventory").exists()
 
 
 def test_bundled_dummy_repo_keeps_every_text_file(tmp_path: Path) -> None:

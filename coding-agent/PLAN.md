@@ -317,7 +317,7 @@ stateDiagram-v2
   3. Run `docker run -d --name <container_name> -p 127.0.0.1:<port>:7700 -e HOST_ID=<host_id> -e COW_ROOT=/cow -v <abs COW_ROOT>:/cow <DAEMON_IMAGE>`.
   4. Poll `/health` until a new `boot_id` appears, with a 30 s limit.
   5. Run `generation += 1`, set `healthy`, and log `host.replaced`.
-- **Waiting sessions.** `wait_for_host` returns as soon as the session's own host is `healthy` again, which is the main path and shows "new host resumes where the old one stopped." If that takes longer than `MIGRATE_AFTER_S = 20`, the session moves to the other healthy host and logs `session.migrated`. That works because `data/cow/` is shared.
+- **Waiting sessions.** One missed heartbeat marks the host `suspect` and leaves the session there. `HEALTH_FAIL_THRESHOLD` (3) missed heartbeats mark it `down`, move the session to another healthy host, and log `session.migrated`. A killed container is not started again until 20 seconds after the kill. A heartbeat that succeeds before the third miss clears the streak. If no other host is healthy, the session waits for its own host to come back. Migration works because `data/cow/` is shared.
 - Docker CLI calls stay inside `hosts.DockerControl` and run through `asyncio.create_subprocess_exec`.
 
 ### LLM client (`llm.py`)
@@ -327,7 +327,7 @@ The model is the live Grok API. Runs, streaming, and both crash demos go through
 - Default `LLM_MODE=live`. `CURSOR_BASE_URL=https://api.x.ai/v1`, `CURSOR_MODEL=grok-4.7`, unless the key's endpoint needs a different base URL or model name.
 - The key is written only to `coding-agent/.env` as `CURSOR_API_KEY`. That file is already in [.gitignore](.gitignore). It is never committed, never put in `PLAN.md`, and never logged. [.env.example](.env.example) keeps an empty `CURSOR_API_KEY=`.
 - `POST {CURSOR_BASE_URL}/chat/completions` with `{model, messages, tools, tool_choice: "auto", stream: true}` and `Authorization: Bearer {CURSOR_API_KEY}`, using httpx with `timeout=httpx.Timeout(connect=10, read=120, write=30, pool=10)`.
-- Parse `data:` lines, joining `delta.content` and `delta.tool_calls[i].function.arguments` by index. If the joined arguments are not valid JSON, the call goes back to the model as a tool error.
+- Parse `data:` lines, joining `delta.content` and `delta.tool_calls[i].function.arguments` by index. If the joined arguments are not a JSON object, or the tool name is not in the daemon's tool list, the reply is discarded and the model call is retried. It is not stored as a tool result.
 - The `tools` parameter comes from the daemon's `tools/list` result, mapped to `{type: "function", function: {name, description, parameters: inputSchema}}` and cached per process.
 - Startup refuses to boot when `LLM_MODE=live` and `CURSOR_API_KEY` is empty, so a missing key fails immediately instead of silently doing nothing.
 - Unit tests of the step machine inject a fake client. They do not call Grok and do not need the key.

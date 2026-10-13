@@ -217,7 +217,14 @@ def test_host_generation_survives_restart_and_increments_on_replace(tmp_path: Pa
     assert restarted.generation == 2
     assert restarted.status == "healthy"
     host_events = [event.type for event in store.global_events_after(0)]
-    assert host_events == ["host.healthy", "host.suspect", "host.down", "host.replacing", "host.replaced"]
+    assert host_events == [
+        "host.healthy",
+        "host.suspect",
+        "host.suspect",
+        "host.down",
+        "host.replacing",
+        "host.replaced",
+    ]
     store.close()
 
 

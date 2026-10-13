@@ -28,9 +28,31 @@ def decide(messages: list[Message], calls: list[ToolCall]) -> str:
     return "model"
 
 
-def parse_model_calls(turn: AssistantTurn) -> list[ModelCall]:
+def tool_names_from(tools: list[dict[str, Any]]) -> set[str]:
+    names: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str) and function["name"]:
+            names.add(function["name"])
+    return names
+
+
+def parse_model_calls(turn: AssistantTurn, tool_names: set[str] | None = None) -> list[ModelCall]:
     parsed: list[ModelCall] = []
     for call in turn.tool_calls:
+        if tool_names is not None and call.name not in tool_names:
+            parsed.append(
+                ModelCall(
+                    model_call_id=call.id,
+                    name=call.name,
+                    arguments_json=call.arguments,
+                    valid=False,
+                    invalid_reason="unknown tool: %s" % (call.name or ""),
+                )
+            )
+            continue
         raw = call.arguments if call.arguments != "" else "{}"
         try:
             arguments = json.loads(raw)
@@ -56,6 +78,13 @@ def parse_model_calls(turn: AssistantTurn) -> list[ModelCall]:
             )
         )
     return parsed
+
+
+def malformed_reason(calls: list[ModelCall]) -> str | None:
+    for call in calls:
+        if not call.valid:
+            return call.invalid_reason or "malformed tool call"
+    return None
 
 
 class Agent:
@@ -121,6 +150,8 @@ class Agent:
 
     async def _run_model(self, session: Session, messages: list[Message]) -> None:
         attempt = 0
+        turn: AssistantTurn | None = None
+        calls: list[ModelCall] = []
         while True:
             await self._db(self.store.note_llm_started, self.owner, session.session_id, session.step)
             try:
@@ -131,6 +162,11 @@ class Agent:
                     [message.to_api() for message in messages],
                     tools,
                 )
+                calls = parse_model_calls(turn, tool_names_from(tools))
+                reason = malformed_reason(calls)
+                if reason:
+                    # The reply never lands in the transcript. The same messages go out again.
+                    raise LlmRetryable(reason)
                 break
             except HostUnreachable as exc:
                 reason = "tools: %s" % exc.reason
@@ -157,13 +193,14 @@ class Agent:
                 session.step,
             )
             await self._sleep(backoff)
+        assert turn is not None
         await self._db(
             self.store.commit_model_turn,
             self.owner,
             session.session_id,
             session.step,
             turn.content or None,
-            parse_model_calls(turn),
+            calls,
             turn.reasoning,
         )
 

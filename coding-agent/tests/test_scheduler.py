@@ -188,18 +188,25 @@ def test_three_failures_then_replace_bumps_generation(tmp_path: Path, caplog: py
     asyncio.run(scenario())
 
 
-def test_report_failure_replaces_without_waiting_for_three_probes(tmp_path: Path) -> None:
+def test_one_missed_heartbeat_does_not_replace_or_move(tmp_path: Path) -> None:
     async def scenario() -> None:
         store, client, docker, scheduler, _clock = _world(tmp_path)
         store.record_health_success("host-a", "boot-1")
+        store.record_health_success("host-b", "boot-b")
+        session = store.create_session(prompt="task", max_steps=4, system_prompt="s", idempotency_key="k")
+        store.claim_sessions("owner-a", 1, 10)
+        store.assign_host("owner-a", session.session_id, "host-a", 1)
         client.push("http://127.0.0.1:7701", DaemonError("refused"))
-        client.push("http://127.0.0.1:7701", Health("host-a", "boot-2", True, 0.2))
         await scheduler.report_failure("host-a")
-        assert store.get_host("host-a").generation == 2
-        assert docker.runs == 1
-        types = [event.type for event in store.global_events_after(0)]
-        assert "host.down" in types
-        assert types[-2:] == ["host.replacing", "host.replaced"]
+        assert store.get_host("host-a").status == "suspect"
+        assert store.get_host("host-a").consecutive_failures == 1
+        assert store.get_session(session.session_id).host_id == "host-a"
+        assert docker.runs == 0
+        client.push("http://127.0.0.1:7701", Health("host-a", "boot-1", True, 1))
+        await scheduler.report_failure("host-a")
+        assert store.get_host("host-a").status == "healthy"
+        assert store.get_host("host-a").consecutive_failures == 0
+        assert store.get_session(session.session_id).host_id == "host-a"
         store.close()
 
     asyncio.run(scenario())
@@ -264,7 +271,7 @@ def test_wait_returns_the_same_host_when_it_recovers(tmp_path: Path) -> None:
     async def scenario() -> None:
         store, _client, _docker, scheduler, clock = _world(tmp_path, migrate_after_s=20)
         store.record_health_success("host-a", "boot-1")
-        store.record_health_success("host-b", "boot-b")
+        store.force_down("host-b")
         session = store.create_session(prompt="task", max_steps=4, system_prompt="s", idempotency_key="k")
         store.claim_sessions("owner-a", 1, 10)
         store.assign_host("owner-a", session.session_id, "host-a", 1)
@@ -278,6 +285,90 @@ def test_wait_returns_the_same_host_when_it_recovers(tmp_path: Path) -> None:
         assignment = await scheduler.wait_for_host(session.session_id)
         assert assignment.host_id == "host-a"
         assert assignment.generation == 1
+        assert store.get_session(session.session_id).host_id == "host-a"
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_session_moves_only_after_three_missed_heartbeats(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, client, docker, scheduler, _clock = _world(tmp_path, migrate_after_s=20)
+        store.record_health_success("host-a", "boot-a")
+        store.record_health_success("host-b", "boot-b")
+        session = store.create_session(prompt="task", max_steps=4, system_prompt="s", idempotency_key="k")
+        store.claim_sessions("owner-a", 1, 10)
+        store.assign_host("owner-a", session.session_id, "host-a", 1)
+        endpoint = "http://127.0.0.1:7701"
+        client.push(endpoint, DaemonError("refused"))
+        await scheduler.report_failure("host-a")
+        client.push(endpoint, DaemonError("refused"))
+        await scheduler.report_failure("host-a")
+        assert store.get_host("host-a").status == "suspect"
+        assert store.get_host("host-a").consecutive_failures == 2
+        assert store.get_session(session.session_id).host_id == "host-a"
+        assert docker.runs == 0
+        client.push(endpoint, DaemonError("refused"))
+        client.push(endpoint, Health("host-a", "boot-2", True, 0.1))
+        await scheduler.report_failure("host-a")
+        assert store.get_session(session.session_id).host_id == "host-b"
+        migrated = [event for event in store.events_after(session.session_id, 0) if event.type == "session.migrated"]
+        assert migrated[-1].payload == {"from": "host-a", "to": "host-b", "generation": 1}
+        suspects = [event for event in store.global_events_after(0) if event.type == "host.suspect"]
+        assert [event.payload["failures"] for event in suspects] == [1, 2]
+        before = _clock.now
+        await asyncio.gather(*scheduler._recovery)
+        assert _clock.now >= before + 20
+        assert docker.runs == 1
+        assert store.get_host("host-a").generation == 2
+        assert store.get_session(session.session_id).host_id == "host-b"
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_kill_keeps_the_host_down_for_20_seconds(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, client, docker, scheduler, clock = _world(tmp_path, migrate_after_s=20)
+        store.record_health_success("host-a", "boot-a")
+        store.record_health_success("host-b", "boot-b")
+        session = store.create_session(prompt="task", max_steps=4, system_prompt="s", idempotency_key="k")
+        store.claim_sessions("owner-a", 1, 10)
+        store.assign_host("owner-a", session.session_id, "host-a", 1)
+        client.push("http://127.0.0.1:7701", Health("host-a", "boot-2", True, 0.1))
+        before = clock.now
+        await scheduler.abandon_host("host-a")
+        assert clock.now == before
+        assert store.get_host("host-a").status == "down"
+        assert docker.commands == []
+        assert store.get_session(session.session_id).host_id == "host-b"
+        await asyncio.gather(*scheduler._recovery)
+        assert clock.now >= before + 20
+        assert store.get_host("host-a").status == "healthy"
+        assert store.get_host("host-a").generation == 2
+        assert ("rm", "coding-agent-host-a") in docker.commands
+        assert store.get_session(session.session_id).host_id == "host-b"
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_suspect_host_keeps_the_session_until_it_recovers(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, _client, _docker, scheduler, _clock = _world(tmp_path)
+        store.record_health_success("host-a", "boot-a")
+        store.record_health_success("host-b", "boot-b")
+        session = store.create_session(prompt="task", max_steps=4, system_prompt="s", idempotency_key="k")
+        store.claim_sessions("owner-a", 1, 10)
+        store.assign_host("owner-a", session.session_id, "host-a", 1)
+        store.record_health_failure("host-a", 3)
+
+        async def recover(_seconds: float) -> None:
+            store.record_health_success("host-a", "boot-a")
+
+        scheduler._sleep = recover
+        assignment = await scheduler.wait_for_host(session.session_id)
+        assert assignment.host_id == "host-a"
         assert store.get_session(session.session_id).host_id == "host-a"
         store.close()
 

@@ -60,6 +60,7 @@ class Session:
     final_answer: str | None
     error: str | None
     import_id: str | None
+    base_fingerprint: str | None
     created_at: float
     updated_at: float
 
@@ -279,8 +280,7 @@ class Store:
                 """,
                 (failures, now, host_id),
             )
-            if row["status"] != "suspect":
-                self._event(conn, type="host.suspect", host_id=host_id, payload={"failures": failures})
+            self._event(conn, type="host.suspect", host_id=host_id, payload={"failures": failures})
             return "suspect"
 
     def force_down(self, host_id: str) -> None:
@@ -342,6 +342,7 @@ class Store:
         title: str | None = None,
         session_id: str | None = None,
         import_id: str | None = None,
+        base_fingerprint: str | None = None,
     ) -> Session:
         now = time.time()
         with self._tx() as conn:
@@ -358,10 +359,10 @@ class Store:
                 """
                 INSERT INTO sessions (
                   session_id, idempotency_key, title, prompt, status, step, max_steps,
-                  import_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?)
+                  import_id, base_fingerprint, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)
                 """,
-                (session_id, idempotency_key, chosen, prompt, max_steps, import_id, now, now),
+                (session_id, idempotency_key, chosen, prompt, max_steps, import_id, base_fingerprint, now, now),
             )
             self._insert_message(conn, session_id, 0, "system", system_prompt, None, None, 0, now)
             self._insert_message(conn, session_id, 1, "user", prompt, None, None, 0, now)
@@ -373,6 +374,44 @@ class Store:
             )
             row = conn.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
             return _session(row)
+
+    def set_base_fingerprint(self, session_id: str, fingerprint: str) -> None:
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE sessions SET base_fingerprint=?, updated_at=? WHERE session_id=?",
+                (fingerprint, time.time(), session_id),
+            )
+
+    def reopen_with_prompt(self, session_id: str, prompt: str, base_fingerprint: str | None = None) -> Session:
+        """Queue the session again. A fingerprint replaces the one taken when the session started."""
+        now = time.time()
+        recorded = base_fingerprint if base_fingerprint else None
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+            if row is None:
+                raise SessionNotFound(session_id)
+            previous = str(row["status"])
+            idx = self._next_idx(conn, session_id)
+            self._insert_message(conn, session_id, idx, "user", prompt, None, None, int(row["step"]), now)
+            conn.execute(
+                """
+                UPDATE sessions
+                   SET status='queued', lease_owner=NULL, lease_expires_at=NULL,
+                       final_answer=NULL, error=NULL,
+                       base_fingerprint=COALESCE(?, base_fingerprint),
+                       updated_at=?
+                 WHERE session_id=?
+                """,
+                (recorded, now, session_id),
+            )
+            self._event(
+                conn,
+                session_id=session_id,
+                type="session.status",
+                payload={"from": previous, "to": "queued", "reason": "conflict"},
+            )
+            updated = conn.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+            return _session(updated)
 
     def get_by_idempotency(self, key: str) -> Session | None:
         row = self._one("SELECT * FROM sessions WHERE idempotency_key=?", (key,))
@@ -921,6 +960,7 @@ def _session(row: sqlite3.Row) -> Session:
         final_answer=row["final_answer"],
         error=row["error"],
         import_id=row["import_id"],
+        base_fingerprint=row["base_fingerprint"],
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
     )

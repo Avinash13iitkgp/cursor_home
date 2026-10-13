@@ -104,6 +104,30 @@ def load_import(cow_root: Path, import_id: str) -> dict[str, object]:
     return {"import_id": import_id, "name": data.get("name") or "folder", "files": files}
 
 
+def materialize_empty(cow_root: Path, session_id: str) -> None:
+    """Create an empty workspace so the daemon does not copy the dummy repo into it."""
+    if not isinstance(session_id, str) or not session_id or "/" in session_id or ".." in session_id:
+        raise ImportError("invalid session")
+    sessions = cow_root / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(sessions / ("%s.lock" % session_id), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        session = sessions / session_id
+        ready = session / ".ready"
+        workspace = session / "workspace"
+        if ready.is_file() and workspace.is_dir():
+            return
+        session.mkdir(parents=True, exist_ok=True)
+        if workspace.exists():
+            shutil.rmtree(workspace)
+        workspace.mkdir()
+        ready.write_text(json.dumps({"version": 1, "empty": True}), encoding="utf-8")
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 def materialize_import(cow_root: Path, session_id: str, import_id: str) -> None:
     """Copy a staged folder into the session workspace before the daemon ensure runs."""
     _check_id(import_id)

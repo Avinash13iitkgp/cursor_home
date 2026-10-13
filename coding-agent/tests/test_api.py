@@ -56,6 +56,10 @@ class _Docker:
 class _Scheduler:
     def __init__(self) -> None:
         self.docker = _Docker()
+        self.abandoned: list[str] = []
+
+    async def abandon_host(self, host_id: str) -> None:
+        self.abandoned.append(host_id)
 
 
 class _Request:
@@ -118,6 +122,25 @@ def test_sessions_are_idempotent_and_cancelable(tmp_path: Path) -> None:
     store.close()
 
 
+def test_session_without_a_folder_starts_empty(tmp_path: Path) -> None:
+    client, store, _events, _scheduler = _app(tmp_path)
+    with client:
+        created = client.post(
+            "/api/sessions",
+            json={"prompt": "Create a new Python package named splitbill."},
+            headers={"Idempotency-Key": "empty"},
+        )
+        assert created.status_code == 200
+        session_id = created.json()["session"]["session_id"]
+        files = client.get("/api/sessions/%s/files" % session_id)
+        assert files.status_code == 200
+        assert files.json()["files"] == []
+        detail = client.get("/api/sessions/%s" % session_id).json()
+        assert "starts empty" in detail["messages"][0]["content"]
+        assert not (tmp_path / "cow" / "sessions" / session_id / "workspace" / "inventory").exists()
+    store.close()
+
+
 def test_folder_import_seeds_the_session_workspace(tmp_path: Path) -> None:
     client, store, _events, _scheduler = _app(tmp_path)
     with client:
@@ -143,6 +166,56 @@ def test_folder_import_seeds_the_session_workspace(tmp_path: Path) -> None:
     store.close()
 
 
+def test_llm_resolve_adopts_the_current_base_fingerprint(tmp_path: Path) -> None:
+    client, store, _events, _scheduler = _app(tmp_path)
+    base = tmp_path / "cow" / "base" / "dummy-repo"
+    base.mkdir(parents=True)
+    (base / "hello.py").write_text("print('base')\n", encoding="utf-8")
+    with client:
+        created = client.post(
+            "/api/sessions",
+            json={"prompt": "edit hello"},
+            headers={"Idempotency-Key": "commit"},
+        )
+        assert created.status_code == 200
+        session_id = created.json()["session"]["session_id"]
+        original = created.json()["session"]["base_fingerprint"]
+        (base / "hello.py").write_text("print('someone else')\n", encoding="utf-8")
+        workspace = tmp_path / "cow" / "sessions" / session_id / "workspace"
+        (workspace / "hello.py").write_text("print('edited')\n", encoding="utf-8")
+        conflict = client.post("/api/sessions/%s/commit" % session_id, json={"confirm": True})
+        assert conflict.status_code == 409
+        resolved = client.post(
+            "/api/sessions/%s/commit" % session_id,
+            json={"confirm": True, "allow_llm": True},
+        )
+        assert resolved.status_code == 200
+        body = resolved.json()
+        assert body["resolved"] == "llm"
+        assert body["base_fingerprint"] != original
+        assert body["session"]["base_fingerprint"] == body["base_fingerprint"]
+        assert body["session"]["status"] == "queued"
+        saved = client.post("/api/sessions/%s/commit" % session_id, json={"confirm": True})
+        assert saved.status_code == 200
+        assert (base / "hello.py").read_text(encoding="utf-8") == "print('edited')\n"
+        (base / "hello.py").write_text("print('later')\n", encoding="utf-8")
+        again = client.post("/api/sessions/%s/commit" % session_id, json={"confirm": True})
+        assert again.status_code == 409
+    store.close()
+
+
+def test_trajectory_page_is_its_own_url(tmp_path: Path) -> None:
+    page = tmp_path / "ui" / "index.html"
+    page.parent.mkdir()
+    page.write_text("<title>Coding agent</title>", encoding="utf-8")
+    client, store, _events, _scheduler = _app(tmp_path)
+    with client:
+        response = client.get("/sessions/s_abc/trajectory")
+        assert response.status_code == 200
+        assert "Coding agent" in response.text
+    store.close()
+
+
 def test_kill_host_does_not_start_a_replacement(tmp_path: Path) -> None:
     client, store, _events, scheduler = _app(tmp_path)
     store.upsert_host("host-a", "http://127.0.0.1:7701", "coding-agent-host-a", 7701)
@@ -153,6 +226,7 @@ def test_kill_host_does_not_start_a_replacement(tmp_path: Path) -> None:
         killed = client.post("/api/hosts/host-a/kill")
         assert killed.status_code == 200
         assert scheduler.docker.killed == ["coding-agent-host-a"]
+        assert scheduler.abandoned == ["host-a"]
         assert client.post("/api/hosts/missing/kill").status_code == 404
     store.close()
 

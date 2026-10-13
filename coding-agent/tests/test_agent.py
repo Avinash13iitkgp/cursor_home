@@ -123,10 +123,22 @@ def _claimed(tmp_path: Path, max_steps: int = 30) -> tuple[Store, EventLog, str]
 def test_decide_and_invalid_arguments() -> None:
     assert parse_model_calls(AssistantTurn("ok", []))[0].valid is False if False else True
     parsed = parse_model_calls(
-        AssistantTurn("", [ModelToolCall("c1", "read_file", "{"), ModelToolCall("c2", "read_file", '{"path":"a"}')])
+        AssistantTurn(
+            "",
+            [
+                ModelToolCall("c1", "read_file", "{"),
+                ModelToolCall("c2", "read_file", '{"path":"a"}'),
+                ModelToolCall("c3", "compile_file", "{}"),
+                ModelToolCall("c4", "read_file", "[]"),
+            ],
+        ),
+        {"read_file"},
     )
     assert parsed[0].valid is False
+    assert parsed[0].invalid_reason == "invalid tool arguments"
     assert parsed[1].valid is True
+    assert parsed[2].invalid_reason == "unknown tool: compile_file"
+    assert parsed[3].invalid_reason == "invalid tool arguments"
     assert decide([], []) == "model"
 
 
@@ -240,21 +252,63 @@ def test_dead_host_retries_the_same_op_after_replace(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-def test_invalid_arguments_skip_the_daemon_and_return_to_the_model(tmp_path: Path) -> None:
+def test_malformed_tool_call_retries_without_committing(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, events, session_id = _claimed(tmp_path)
+        llm = ScriptedLlm(
+            [
+                AssistantTurn("partial", [ModelToolCall("c1", "read_file", "{")]),
+                AssistantTurn("", [ModelToolCall("c2", "compile_file", "{}")]),
+                AssistantTurn("fixed", []),
+            ]
+        )
+        scheduler = FakeScheduler()
+        backoffs: list[float] = []
+
+        async def record(seconds: float) -> None:
+            backoffs.append(seconds)
+
+        agent = Agent(store, events, scheduler, llm, "owner-a", sleeper=record)
+        await agent.run(session_id)
+        assert scheduler.calls == []
+        assert llm.calls == 3
+        assert backoffs == [1, 2]
+        assert store.list_tool_calls(session_id) == []
+        assistants = [message for message in store.list_messages(session_id) if message.role == "assistant"]
+        assert [message.content for message in assistants] == ["fixed"]
+        reasons = [event.payload["reason"] for event in store.events_after(session_id, 0) if event.type == "llm.retry"]
+        assert reasons == ["invalid tool arguments", "unknown tool: compile_file"]
+        assert store.get_session(session_id).final_answer == "fixed"
+        store.close()
+
+    asyncio.run(scenario())
+
+
+def test_repeated_malformed_tool_calls_stop_the_session(tmp_path: Path) -> None:
     async def scenario() -> None:
         store, events, session_id = _claimed(tmp_path)
         llm = ScriptedLlm(
             [
                 AssistantTurn("", [ModelToolCall("c1", "read_file", "{")]),
-                AssistantTurn("fixed", []),
+                AssistantTurn("", [ModelToolCall("c2", "read_file", "{")]),
+                AssistantTurn("", [ModelToolCall("c3", "read_file", "{")]),
             ]
         )
-        scheduler = FakeScheduler()
-        agent = Agent(store, events, scheduler, llm, "owner-a", sleeper=lambda _seconds: _asleep())
+        agent = Agent(
+            store,
+            events,
+            FakeScheduler(),
+            llm,
+            "owner-a",
+            sleeper=lambda _seconds: _asleep(),
+            max_model_retries=3,
+        )
         await agent.run(session_id)
-        assert scheduler.calls == []
-        assert llm.calls == 2
-        assert store.get_session(session_id).final_answer == "fixed"
+        session = store.get_session(session_id)
+        assert session.status == "failed"
+        assert session.error == "model unreachable after 3 retries: invalid tool arguments"
+        assert store.list_tool_calls(session_id) == []
+        assert llm.calls == 3
         store.close()
 
     async def _asleep() -> None:

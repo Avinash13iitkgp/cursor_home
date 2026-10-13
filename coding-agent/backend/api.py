@@ -11,18 +11,30 @@ from typing import Any, AsyncIterator, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.agent import Agent
 from backend.config import Settings, load_settings
 from backend.events import EventLog
 from backend.imports import ImportError as FolderImportError
-from backend.imports import import_tree, list_workspace_files, load_import, materialize_import, read_workspace_file, save_import
+from backend.imports import import_tree, list_workspace_files, load_import, materialize_empty, materialize_import, read_workspace_file, save_import
 from backend.hosts import DaemonClient, DockerControl, DockerError
 from backend.llm import GrokClient
 from backend.runner import Runner
 from backend.scheduler import Scheduler
+from backend.snapshot import (
+    NothingToRevert,
+    SnapshotConflict,
+    base_repo,
+    commit_workspace,
+    diff_summary,
+    ensure_revert_source,
+    fingerprint_tree,
+    history_dir,
+    list_history,
+    revert_base,
+)
 from backend.store import Event, Message, Session, SessionNotFound, Store, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -66,6 +78,7 @@ def _session_dict(session: Session) -> dict[str, Any]:
         "final_answer": session.final_answer,
         "error": session.error,
         "import_id": session.import_id,
+        "base_fingerprint": session.base_fingerprint,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
     }
@@ -220,22 +233,110 @@ def create_app(
         if existing is not None:
             return {"session": _session_dict(existing)}
         session_id = "s_" + uuid4().hex[:12]
-        if import_id:
-            try:
+        empty = not import_id
+        try:
+            if import_id:
                 await asyncio.to_thread(materialize_import, settings.cow_root, session_id, import_id)
-            except FolderImportError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            else:
+                await asyncio.to_thread(materialize_empty, settings.cow_root, session_id)
+        except FolderImportError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        fingerprint = await asyncio.to_thread(fingerprint_tree, base_repo(settings.cow_root))
         session = await asyncio.to_thread(
             store.create_session,
             prompt=prompt,
             max_steps=settings.max_steps,
-            system_prompt=_system_prompt(),
+            system_prompt=_system_prompt(empty=empty),
             idempotency_key=idempotency_key,
             title=title,
             session_id=session_id,
             import_id=import_id,
+            base_fingerprint=fingerprint,
         )
         return {"session": _session_dict(session)}
+
+    @app.post("/api/sessions/{session_id}/commit")
+    async def commit_session(session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        if body.get("confirm") is not True:
+            raise HTTPException(status_code=400, detail="confirm must be true")
+        try:
+            session = await asyncio.to_thread(store.get_session, session_id)
+        except SessionNotFound as exc:
+            raise HTTPException(status_code=404, detail="session not found") from exc
+        if body.get("allow_llm") is True:
+            base = base_repo(settings.cow_root)
+            workspace = settings.cow_root / "sessions" / session_id / "workspace"
+            summary = await asyncio.to_thread(diff_summary, workspace, base)
+            current = await asyncio.to_thread(fingerprint_tree, base)
+            prompt = (
+                "The base snapshot changed while this session was editing. "
+                "Do not assume your files still match the base. Re-read the files you changed, "
+                "reconcile them, and leave the workspace ready to commit.\n\n%s" % summary
+            )
+            updated = await asyncio.to_thread(store.reopen_with_prompt, session_id, prompt, current)
+            return {
+                "conflict": True,
+                "resolved": "llm",
+                "base_fingerprint": current,
+                "session": _session_dict(updated),
+            }
+        try:
+            fingerprint = await asyncio.to_thread(
+                commit_workspace,
+                settings.cow_root,
+                session_id,
+                session.base_fingerprint,
+                settings.root / "dummy-repo",
+            )
+        except SnapshotConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "conflict": True,
+                    "expected": exc.expected,
+                    "actual": exc.actual,
+                    "summary": exc.summary,
+                },
+            ) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        await asyncio.to_thread(store.set_base_fingerprint, session_id, fingerprint)
+        updated = await asyncio.to_thread(store.get_session, session_id)
+        return {"conflict": False, "base_fingerprint": fingerprint, "session": _session_dict(updated)}
+
+    @app.get("/api/snapshot/history")
+    async def snapshot_history() -> dict[str, Any]:
+        seed = settings.root / "dummy-repo"
+        await asyncio.to_thread(ensure_revert_source, settings.cow_root, seed)
+        entries = await asyncio.to_thread(list_history, settings.cow_root)
+        if entries:
+            tree = history_dir(settings.cow_root) / str(entries[0]["id"]) / "tree"
+            entries[0]["summary"] = await asyncio.to_thread(
+                diff_summary,
+                tree,
+                base_repo(settings.cow_root),
+                40,
+                "the saved snapshot",
+                "the current base",
+            )
+        return {"entries": entries}
+
+    @app.post("/api/snapshot/revert")
+    async def snapshot_revert(body: dict[str, Any]) -> dict[str, Any]:
+        if body.get("confirm") is not True:
+            raise HTTPException(status_code=400, detail="confirm must be true")
+        try:
+            restored = await asyncio.to_thread(revert_base, settings.cow_root)
+        except NothingToRevert as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        info = restored["restored"]
+        session_id = ""
+        if isinstance(info, dict):
+            session_id = str(info.get("session_id") or "")
+        fingerprint = str(restored["base_fingerprint"])
+        if session_id:
+            await asyncio.to_thread(store.set_base_fingerprint, session_id, fingerprint)
+        return {"base_fingerprint": fingerprint, "restored": info}
 
     @app.post("/api/imports")
     async def create_import(body: dict[str, Any]) -> dict[str, Any]:
@@ -367,6 +468,7 @@ def create_app(
             await scheduler.docker.kill(host.container_name)
         except DockerError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        await scheduler.abandon_host(host_id)
         return {"killed": host.container_name}
 
     @app.get("/api/task")
@@ -375,6 +477,13 @@ def create_app(
         if not path.is_file():
             raise HTTPException(status_code=404, detail="TASK.md not found")
         return {"text": path.read_text(encoding="utf-8")}
+
+    @app.get("/sessions/{session_id}/trajectory")
+    async def trajectory_page(session_id: str) -> FileResponse:
+        page = settings.root / "ui" / "index.html"
+        if not page.is_file():
+            raise HTTPException(status_code=404, detail="ui not found")
+        return FileResponse(page)
 
     ui_dir = settings.root / "ui"
     if ui_dir.is_dir():
@@ -425,7 +534,16 @@ def __getattr__(name: str) -> FastAPI:
     raise AttributeError(name)
 
 
-def _system_prompt() -> str:
+def _system_prompt(*, empty: bool = False) -> str:
+    if empty:
+        return (
+            "You are a coding agent. This workspace starts empty. There is no existing project in it. "
+            "Create the Python project the user asked for. "
+            "Paths are relative to the workspace root. "
+            "Write tests under tests/ and call run_tests with the default target until the suite passes. "
+            "Do not use target baseline. "
+            "When the task is finished and run_tests reports that the suite passed, reply with a short summary and do not call any tools."
+        )
     return (
         "You are a coding agent working in one session workspace that already contains a Python project. "
         "Inspect and edit files with the provided tools. "

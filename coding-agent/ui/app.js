@@ -70,6 +70,7 @@ let down = false;
 let reconnects = 0;
 let selectToken = 0;
 let sessionSource = null;
+let snapshotHistory = [];
 let sessionsChain = Promise.resolve();
 let hostsChain = Promise.resolve();
 
@@ -273,7 +274,10 @@ function renderHeader(session) {
     meta.textContent = "";
     cancel.disabled = true;
     document.getElementById("live-code").disabled = true;
-    document.getElementById("trajectory").disabled = true;
+    document.getElementById("commit").disabled = true;
+    const trajectory = document.getElementById("trajectory");
+    trajectory.setAttribute("aria-disabled", "true");
+    trajectory.href = "/sessions/";
     showFinal({ status: "" });
     return;
   }
@@ -291,7 +295,10 @@ function renderHeader(session) {
   meta.appendChild(elapsed);
   cancel.disabled = TERMINAL.has(session.status);
   document.getElementById("live-code").disabled = false;
-  document.getElementById("trajectory").disabled = false;
+  document.getElementById("commit").disabled = false;
+  const trajectory = document.getElementById("trajectory");
+  trajectory.removeAttribute("aria-disabled");
+  trajectory.href = trajectoryUrl(session.session_id);
   showFinal(session);
 }
 
@@ -326,7 +333,20 @@ function renderSessionList() {
     elapsed.textContent = formatElapsed(session.created_at, session.updated_at, TERMINAL.has(session.status));
     row.appendChild(elapsed);
     button.append(title, row);
-    sessionsEl.appendChild(button);
+    const wrap = document.createElement("div");
+    wrap.className = "session-row";
+    wrap.appendChild(button);
+    if (!TERMINAL.has(session.status)) {
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "stop-task";
+      stop.dataset.cancel = session.session_id;
+      stop.title = "Cancel";
+      stop.setAttribute("aria-label", "Cancel " + (session.title || session.session_id));
+      stop.textContent = "■";
+      wrap.appendChild(stop);
+    }
+    sessionsEl.appendChild(wrap);
   }
   renderHosts();
 }
@@ -426,7 +446,7 @@ function paintCard(state) {
   const details = node.querySelector("details");
   if (state.result) {
     details.hidden = false;
-    details.querySelector("pre").textContent = state.result;
+    setHighlighted(details.querySelector("pre"), state.result);
   } else {
     details.hidden = true;
   }
@@ -543,11 +563,90 @@ function toolLabel(event) {
   return name + " · " + event.type.slice("tool.".length);
 }
 
+function escapeHtml(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function highlightPython(source) {
+  const re = /(#.*)|("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')|(\b(?:def|class|return|if|elif|else|for|while|import|from|as|try|except|finally|with|yield|lambda|pass|break|continue|in|not|and|or|is|None|True|False|raise|async|await)\b)|(\b\d+(?:\.\d+)?\b)|(\b[A-Za-z_][A-Za-z0-9_]*(?=\s*\())|([\s\S])/g;
+  let out = "";
+  let match;
+  while ((match = re.exec(source))) {
+    if (match[1]) out += '<span class="tok-comment">' + escapeHtml(match[1]) + "</span>";
+    else if (match[2]) out += '<span class="tok-string">' + escapeHtml(match[2]) + "</span>";
+    else if (match[3]) out += '<span class="tok-keyword">' + escapeHtml(match[3]) + "</span>";
+    else if (match[4]) out += '<span class="tok-number">' + escapeHtml(match[4]) + "</span>";
+    else if (match[5]) out += '<span class="tok-fn">' + escapeHtml(match[5]) + "</span>";
+    else out += escapeHtml(match[6] || "");
+  }
+  return out;
+}
+
+function highlightJson(source) {
+  const re = /("(?:\\.|[^"\\])*")(\s*:)?|(-?\b\d+(?:\.\d+)?\b)|(\btrue\b|\bfalse\b|\bnull\b)|([\s\S])/g;
+  let out = "";
+  let match;
+  while ((match = re.exec(source))) {
+    if (match[1] && match[2]) out += '<span class="tok-key">' + escapeHtml(match[1]) + "</span>" + match[2];
+    else if (match[1]) out += '<span class="tok-string">' + escapeHtml(match[1]) + "</span>";
+    else if (match[3]) out += '<span class="tok-number">' + escapeHtml(match[3]) + "</span>";
+    else if (match[4]) out += '<span class="tok-keyword">' + escapeHtml(match[4]) + "</span>";
+    else out += escapeHtml(match[5] || "");
+  }
+  return out;
+}
+
+function highlightCode(text) {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      JSON.parse(trimmed);
+      return highlightJson(text);
+    } catch (_err) {
+      /* not JSON */
+    }
+  }
+  if (/\b(?:def|class|import|from|return)\b/.test(text)) return highlightPython(text);
+  return escapeHtml(text);
+}
+
+function setHighlighted(node, text) {
+  node.innerHTML = highlightCode(text || "");
+}
+
 function prettyArgs(raw) {
   const parsed = parsedArgs(raw);
   if (!raw) return "";
   if (!Object.keys(parsed).length) return String(raw);
   return JSON.stringify(parsed, null, 2);
+}
+
+function addRequest(parent, toolName, raw) {
+  const args = parsedArgs(raw);
+  if (toolName === "write_file" && typeof args.content === "string") {
+    addBlock(parent, args.path || "file", args.content, "request");
+    return;
+  }
+  if (toolName === "replace_in_file") {
+    if (args.path) {
+      const path = document.createElement("p");
+      path.className = "traj-path";
+      path.textContent = args.path;
+      parent.appendChild(path);
+    }
+    if (typeof args.old === "string") addBlock(parent, "Replace", args.old, "request");
+    if (typeof args.new === "string") addBlock(parent, "With", args.new, "response");
+    return;
+  }
+  if (typeof args.path === "string" && typeof args.content !== "string") {
+    const lines = [args.path];
+    if (args.start_line) lines.push("lines " + args.start_line + (args.end_line ? "–" + args.end_line : ""));
+    if (args.pattern) lines.push(String(args.pattern));
+    if (args.glob) lines.push(String(args.glob));
+    addBlock(parent, "Request", lines.join("\n"), "request");
+    return;
+  }
+  addBlock(parent, "Request", prettyArgs(raw), "request");
 }
 
 function renderTimelineDetail() {
@@ -560,8 +659,13 @@ function renderTimelineDetail() {
   const detail = toolDetails.get(event.op_id) || { name: "", args: "", result: "", status: "" };
   panel.hidden = false;
   document.getElementById("timeline-detail-title").textContent = toolLabel(event);
-  document.getElementById("timeline-detail-request").textContent = prettyArgs(detail.args) || "(no request yet)";
-  document.getElementById("timeline-detail-response").textContent = detail.result || "(no response yet)";
+  const request = document.getElementById("timeline-detail-request");
+  const response = document.getElementById("timeline-detail-response");
+  request.replaceChildren();
+  response.replaceChildren();
+  addRequest(request, detail.name, detail.args);
+  if (!request.childElementCount) request.textContent = "(no request yet)";
+  setHighlighted(response, detail.result || "(no response yet)");
 }
 
 async function openTimelineEvent(event) {
@@ -819,6 +923,12 @@ function applyTranscript(event) {
 function apply(event) {
   if (!event || !event.type) return;
   event.payload = event.payload || {};
+  if (event.type === "llm.retry") {
+    liveText = "";
+    liveReasoning = "";
+    const draft = document.getElementById("assistant-draft");
+    if (draft) draft.remove();
+  }
   if (event.type === "assistant.delta" || event.type === "assistant.reasoning") {
     if (event.session_id === selected) {
       const text = event.payload.text || "";
@@ -1031,7 +1141,7 @@ async function pollSupervisor() {
 }
 
 let loadedImport = null;
-let liveOn = false;
+let liveOn = true;
 let openFile = "";
 const codeFiles = new Map();
 const unresolvedFiles = new Set();
@@ -1040,7 +1150,7 @@ function setFolderLabel() {
   const node = document.getElementById("folder-label");
   const clear = document.getElementById("clear-folder");
   if (!loadedImport) {
-    node.firstChild.textContent = "Workspace: dummy repo ";
+    node.firstChild.textContent = "Workspace: empty ";
     clear.hidden = true;
     return;
   }
@@ -1084,6 +1194,7 @@ async function chooseFolder(fileList) {
   const saved = await response.json();
   loadedImport = { id: saved.import_id, name: saved.name, files: files };
   setFolderLabel();
+  clearSampleSelection();
 }
 
 function noteCode(name, args, phase, options) {
@@ -1173,7 +1284,7 @@ function renderCode() {
   const paths = Array.from(codeFiles.keys()).sort();
   if (!paths.length) {
     status.textContent = "No files yet";
-    view.textContent = "Open a folder before starting, or wait for the agent to edit a file.";
+    view.textContent = "This workspace is empty. Files show up here as the agent writes them.";
     return;
   }
   if (!openFile || !codeFiles.has(openFile)) openFile = paths[0];
@@ -1191,7 +1302,7 @@ function renderCode() {
   }
   const file = codeFiles.get(openFile);
   status.textContent = openFile + (file.status ? " · " + file.status : "");
-  view.textContent = file.status === "deleted" ? "" : file.text;
+  setHighlighted(view, file.status === "deleted" ? "" : file.text);
 }
 
 function formatSpan(start, end) {
@@ -1200,15 +1311,12 @@ function formatSpan(start, end) {
   return formatDuration(Math.max(0, Math.round((stop - start) * 1000)));
 }
 
-function contextBefore(step) {
+function contextMessages(step) {
   const assistant = sessionMessages
     .filter((message) => message.role === "assistant" && message.step === step)
     .sort((a, b) => a.idx - b.idx)[0];
   const prior = assistant ? sessionMessages.filter((message) => message.idx < assistant.idx) : sessionMessages;
-  if (!prior.length) return "";
-  return prior
-    .map((message) => message.role + ":\n" + (message.content || ""))
-    .join("\n\n");
+  return prior.map((message) => ({ role: message.role, content: message.content || "" }));
 }
 
 function buildTrajectory() {
@@ -1322,13 +1430,38 @@ function buildTrajectory() {
   return steps;
 }
 
-function addBlock(parent, title, text) {
+function addBlock(parent, title, text, kind) {
   if (!text) return;
+  const section = document.createElement("section");
+  section.className = "traj-block" + (kind ? " " + kind : "");
   const heading = document.createElement("h4");
   heading.textContent = title;
   const body = document.createElement("pre");
-  body.textContent = text;
-  parent.append(heading, body);
+  setHighlighted(body, text);
+  section.append(heading, body);
+  parent.appendChild(section);
+}
+
+function addContext(parent, step) {
+  const messages = contextMessages(step);
+  if (!messages.length) return;
+  const section = document.createElement("section");
+  section.className = "traj-block context";
+  const heading = document.createElement("h4");
+  heading.textContent = "Context sent to the model";
+  section.appendChild(heading);
+  for (const message of messages) {
+    const row = document.createElement("div");
+    row.className = "traj-msg role-" + message.role;
+    const label = document.createElement("span");
+    label.className = "traj-role";
+    label.textContent = message.role;
+    const body = document.createElement("pre");
+    setHighlighted(body, message.content);
+    row.append(label, body);
+    section.appendChild(row);
+  }
+  parent.appendChild(section);
 }
 
 function renderTrajectory() {
@@ -1346,17 +1479,23 @@ function renderTrajectory() {
     return;
   }
   for (const step of steps) {
+    const streaming = step.started != null && !step.finished && (liveText || liveReasoning);
+    const failed = step.retries.length || step.tools.some((tool) => tool.status === "failed" || tool.failures.length);
     const card = document.createElement("article");
-    card.className = "step-card";
+    card.className = "step-card" + (streaming ? " streaming" : "") + (failed ? " has-failure" : "");
     const heading = document.createElement("h3");
-    heading.textContent = "Step " + step.step;
+    const stepName = document.createElement("span");
+    stepName.textContent = "Step " + step.step;
+    const state = document.createElement("span");
+    state.className = "traj-status " + (streaming ? "running" : failed ? "failed" : step.finished ? "succeeded" : "pending");
+    state.textContent = streaming ? "streaming" : failed ? "failed" : step.finished ? "done" : "pending";
+    heading.append(stepName, state);
     const meta = document.createElement("p");
     meta.className = "step-meta";
     const bits = [];
     if (step.started != null) bits.push(formatClock(step.started));
     if (step.finished != null) bits.push("done " + formatClock(step.finished));
     if (step.started != null) bits.push(formatSpan(step.started, step.finished));
-    if (step.retries.length) bits.push(step.retries.length + " model retries");
     meta.textContent = bits.join(" · ");
     card.append(heading, meta);
     for (const retry of step.retries) {
@@ -1365,15 +1504,27 @@ function renderTrajectory() {
       line.textContent = formatClock(retry.ts) + " · model retry " + retry.attempt + " · " + retry.reason + (retry.backoff != null ? " · backoff " + retry.backoff + "s" : "");
       card.appendChild(line);
     }
-    addBlock(card, "Context sent to the model", contextBefore(step.step));
-    addBlock(card, "Reasoning", step.reasoning);
-    addBlock(card, "Model response", step.content);
+    addContext(card, step.step);
+    addBlock(card, "Reasoning", step.reasoning, "reasoning");
+    addBlock(card, "Model response", step.content, streaming ? "response streaming" : "response");
     for (const tool of step.tools) {
       const block = document.createElement("div");
-      block.className = "tool-block";
+      block.className = "tool-block status-" + (tool.status || "pending");
       const name = document.createElement("h4");
-      const timing = tool.started != null ? " · " + formatSpan(tool.started, tool.finished) : "";
-      name.textContent = tool.name + " · " + (tool.status || "pending") + timing + (tool.host ? " · " + tool.host : "") + (tool.attempt ? " · attempt " + tool.attempt : "");
+      const toolName = document.createElement("span");
+      toolName.className = "traj-tool";
+      toolName.textContent = tool.name;
+      const badge = document.createElement("span");
+      badge.className = "traj-status " + (tool.status || "pending");
+      badge.textContent = tool.status || "pending";
+      const timing = document.createElement("span");
+      timing.className = "traj-timing";
+      const bits = [];
+      if (tool.started != null) bits.push(formatSpan(tool.started, tool.finished));
+      if (tool.host) bits.push(tool.host);
+      if (tool.attempt) bits.push("attempt " + tool.attempt);
+      timing.textContent = bits.join(" · ");
+      name.append(toolName, badge, timing);
       block.appendChild(name);
       for (const failure of tool.failures) {
         const line = document.createElement("p");
@@ -1381,20 +1532,206 @@ function renderTrajectory() {
         line.textContent = failure;
         block.appendChild(line);
       }
-      addBlock(block, "Request", prettyArgs(tool.args));
-      addBlock(block, "Response", tool.result);
+      addRequest(block, tool.name, tool.args);
+      addBlock(block, "Response", tool.result, tool.status === "failed" ? "response failed" : "response");
       card.appendChild(block);
     }
     body.appendChild(card);
   }
 }
 
-function toggleTrajectory() {
+function trajectoryUrl(sessionId) {
+  return "/sessions/" + encodeURIComponent(sessionId) + "/trajectory";
+}
+
+function trajectoryIdFromPath() {
+  const match = location.pathname.match(/^\/sessions\/([^/]+)\/trajectory\/?$/);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+function showTrajectory() {
+  trajectoryOpen = true;
+  document.getElementById("trajectory").setAttribute("aria-pressed", "true");
+  document.getElementById("trajectory-panel").hidden = false;
+  const link = document.getElementById("trajectory-link");
+  link.href = location.origin + trajectoryUrl(selected);
+  link.textContent = link.href;
+  renderTrajectory();
+}
+
+function hideTrajectory() {
+  trajectoryOpen = false;
+  document.getElementById("trajectory").setAttribute("aria-pressed", "false");
+  document.getElementById("trajectory-panel").hidden = true;
+}
+
+async function refreshHistory() {
+  const response = await fetch("/api/snapshot/history");
+  if (!response.ok) return;
+  const body = await response.json();
+  snapshotHistory = body.entries || [];
+  document.getElementById("revert").disabled = snapshotHistory.length === 0;
+}
+
+function resetCommitForm() {
+  document.getElementById("commit-check").hidden = false;
+  document.getElementById("commit-confirm").checked = false;
+  document.getElementById("commit-save").hidden = false;
+  document.getElementById("commit-save").disabled = true;
+  document.getElementById("commit-save").textContent = "Save";
+  document.getElementById("commit-llm").hidden = true;
+  document.getElementById("commit-summary").hidden = true;
+  document.getElementById("commit-summary").textContent = "";
+  document.getElementById("commit-dismiss").textContent = "Cancel";
+}
+
+function openCommit() {
   if (!selected) return;
-  trajectoryOpen = !trajectoryOpen;
-  document.getElementById("trajectory").setAttribute("aria-pressed", trajectoryOpen ? "true" : "false");
-  document.getElementById("trajectory-panel").hidden = !trajectoryOpen;
-  if (trajectoryOpen) renderTrajectory();
+  const dialog = document.getElementById("commit-dialog");
+  document.getElementById("commit-form").dataset.mode = "commit";
+  resetCommitForm();
+  document.getElementById("commit-title").textContent = "Commit snapshot";
+  document.getElementById("commit-copy").textContent = "This snapshot will replace the existing code in the base directory.";
+  document.getElementById("commit-check-label").textContent = "Replace the base snapshot with this session's files";
+  dialog.hidden = false;
+}
+
+function openRevert() {
+  const latest = snapshotHistory[0];
+  if (!latest) return;
+  const dialog = document.getElementById("commit-dialog");
+  document.getElementById("commit-form").dataset.mode = "revert";
+  resetCommitForm();
+  document.getElementById("commit-save").textContent = "Revert";
+  document.getElementById("commit-title").textContent = "Revert base snapshot";
+  const when = latest.saved_at ? " Saved " + formatClock(latest.saved_at) + "." : "";
+  document.getElementById("commit-copy").textContent = "This puts the base directory back to the snapshot saved before the last change." + when + " Revert again to undo it.";
+  document.getElementById("commit-check-label").textContent = "Restore that saved snapshot over the current base";
+  const pre = document.getElementById("commit-summary");
+  if (latest.summary) {
+    pre.hidden = false;
+    pre.textContent = latest.summary;
+  }
+  dialog.hidden = false;
+}
+
+function closeCommit() {
+  document.getElementById("commit-dialog").hidden = true;
+}
+
+function showConflict(summary) {
+  document.getElementById("commit-title").textContent = "Base snapshot changed";
+  document.getElementById("commit-copy").textContent = "The base directory was edited after this session started. Saving now would overwrite those changes. You can let the model reconcile the files instead.";
+  const pre = document.getElementById("commit-summary");
+  pre.hidden = false;
+  pre.textContent = summary || "The fingerprints do not match.";
+  document.getElementById("commit-save").hidden = true;
+  document.getElementById("commit-llm").hidden = false;
+}
+
+async function saveCommit(event) {
+  event.preventDefault();
+  if (document.getElementById("commit-form").dataset.mode === "revert") {
+    await saveRevert(event);
+    return;
+  }
+  if (!selected || !document.getElementById("commit-confirm").checked) return;
+  const save = document.getElementById("commit-save");
+  save.disabled = true;
+  save.textContent = "Saving…";
+  document.getElementById("commit-copy").textContent = "Replacing the base snapshot…";
+  try {
+    const response = await fetch("/api/sessions/" + encodeURIComponent(selected) + "/commit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    });
+    if (response.status === 409) {
+      const body = await response.json();
+      const detail = body.detail || {};
+      showConflict(typeof detail === "string" ? detail : detail.summary || "");
+      return;
+    }
+    if (!response.ok) {
+      const message = await errorText(response);
+      document.getElementById("commit-copy").textContent = message;
+      formError(message);
+      return;
+    }
+    closeCommit();
+    formError("");
+    refreshHistory();
+  } finally {
+    if (!document.getElementById("commit-dialog").hidden && document.getElementById("commit-form").dataset.mode === "commit") {
+      save.disabled = !document.getElementById("commit-confirm").checked;
+      save.textContent = "Save";
+    }
+  }
+}
+
+async function saveRevert(event) {
+  event.preventDefault();
+  if (!document.getElementById("commit-confirm").checked) return;
+  const save = document.getElementById("commit-save");
+  save.disabled = true;
+  save.textContent = "Reverting…";
+  document.getElementById("commit-copy").textContent = "Restoring the saved base snapshot…";
+  try {
+    const response = await fetch("/api/snapshot/revert", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    });
+    if (!response.ok) {
+      const message = await errorText(response);
+      document.getElementById("commit-copy").textContent = message;
+      formError(message);
+      return;
+    }
+    await refreshHistory();
+    document.getElementById("commit-title").textContent = "Base snapshot restored";
+    document.getElementById("commit-copy").textContent = snapshotHistory.length
+      ? "The previous snapshot is the base directory again. Revert again to undo this."
+      : "The previous snapshot is the base directory again.";
+    document.getElementById("commit-check").hidden = true;
+    document.getElementById("commit-save").hidden = true;
+    document.getElementById("commit-summary").hidden = true;
+    document.getElementById("commit-dismiss").textContent = "Close";
+    formError("");
+  } finally {
+    if (!document.getElementById("commit-save").hidden) {
+      save.disabled = !document.getElementById("commit-confirm").checked;
+      save.textContent = "Revert";
+    }
+  }
+}
+
+async function resolveCommit() {
+  if (!selected) return;
+  const response = await fetch("/api/sessions/" + encodeURIComponent(selected) + "/commit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm: true, allow_llm: true }),
+  });
+  if (!response.ok) {
+    formError(await errorText(response));
+    return;
+  }
+  const body = await response.json();
+  const known = sessions.find((session) => session.session_id === selected);
+  if (known && body.session) Object.assign(known, body.session);
+  closeCommit();
+  renderSessionList();
+  if (body.session) renderHeader(body.session);
+}
+
+function showLiveCode() {
+  liveOn = true;
+  const button = document.getElementById("live-code");
+  button.setAttribute("aria-pressed", "true");
+  button.disabled = false;
+  document.getElementById("code-panel").hidden = false;
+  renderCode();
 }
 
 function toggleLiveCode() {
@@ -1409,7 +1746,11 @@ async function selectSession(id) {
   const token = ++selectToken;
   closeSessionStream();
   selected = id;
-  if (location.hash !== "#" + id) history.replaceState(null, "", "#" + id);
+  const pathId = trajectoryIdFromPath();
+  if (pathId && pathId !== id) hideTrajectory();
+  if (!pathId || pathId !== id) {
+    if (location.hash !== "#" + id || location.pathname !== "/") history.replaceState(null, "", "/#" + id);
+  }
   renderSessionList();
   renderBanners();
   renderTimeline();
@@ -1429,6 +1770,7 @@ async function selectSession(id) {
   renderSessionList();
   await hydrateCode(detail);
   if (token !== selectToken) return;
+  showLiveCode();
   openSessionStream(id);
 }
 
@@ -1476,38 +1818,75 @@ async function startTask(event) {
   }
 }
 
+const NEW_CODEBASE_PROMPT = [
+  "Create a new Python package named splitbill.",
+  "",
+  "splitbill.ledger.settle(expenses) takes a list of {payer, amount, participants} dicts and returns transfers of {from, to, amount} that clear the group. Amounts are integer cents. Ignore a person who paid and is the only participant. Reject a non-positive amount and an empty participant list.",
+  "",
+  'Add python -m splitbill.cli, which reads a JSON list of expenses on stdin and prints one transfer per line: "alice -> bob 500".',
+  "",
+  "Write tests/test_ledger.py first, covering an even split, uneven payers, and the two rejections. Run run_tests and implement until that suite passes. Add a short README with one example.",
+].join("\n");
+
+let sampleToken = 0;
+
+function selectSample(id) {
+  document.querySelectorAll(".sample").forEach((button) => {
+    button.setAttribute("aria-pressed", button.dataset.sample === id ? "true" : "false");
+  });
+}
+
+function clearSampleSelection() {
+  selectSample("");
+}
+
 async function useDummy() {
+  const token = ++sampleToken;
   formError("");
   const response = await fetch("/api/task");
+  if (token !== sampleToken) return;
   if (!response.ok) {
     formError(await errorText(response));
     return;
   }
   const body = await response.json();
-  promptEl.value = body.text || "";
-  submitKey = "";
   const imported = await fetch("/api/imports/dummy", { method: "POST" });
+  if (token !== sampleToken) return;
   if (!imported.ok) {
     formError(await errorText(imported));
     return;
   }
   const saved = await imported.json();
+  promptEl.value = body.text || "";
+  submitKey = "";
   loadedImport = { id: saved.import_id, name: saved.name, files: saved.files || [] };
   setFolderLabel();
+  selectSample("dummy");
 }
 
-async function cancelSession() {
-  if (!selected) return;
-  const response = await fetch("/api/sessions/" + encodeURIComponent(selected) + "/cancel", { method: "POST" });
+function useNewCodebase() {
+  sampleToken += 1;
+  formError("");
+  loadedImport = null;
+  setFolderLabel();
+  promptEl.value = NEW_CODEBASE_PROMPT;
+  submitKey = "";
+  selectSample("new");
+}
+
+async function cancelSession(sessionId) {
+  const id = typeof sessionId === "string" ? sessionId : selected;
+  if (!id) return;
+  const response = await fetch("/api/sessions/" + encodeURIComponent(id) + "/cancel", { method: "POST" });
   if (!response.ok) {
     formError(await errorText(response));
     return;
   }
   const body = await response.json();
-  const known = sessions.find((session) => session.session_id === selected);
+  const known = sessions.find((session) => session.session_id === id);
   if (known) Object.assign(known, body.session);
   renderSessionList();
-  renderHeader(body.session);
+  if (id === selected) renderHeader(body.session);
 }
 
 async function killHost(hostId) {
@@ -1517,10 +1896,12 @@ async function killHost(hostId) {
 
 document.getElementById("task-form").addEventListener("submit", startTask);
 document.getElementById("dummy").addEventListener("click", useDummy);
+document.getElementById("new-codebase").addEventListener("click", useNewCodebase);
 promptEl.addEventListener("input", () => {
   submitKey = "";
+  clearSampleSelection();
 });
-document.getElementById("cancel").addEventListener("click", cancelSession);
+document.getElementById("cancel").addEventListener("click", () => cancelSession());
 document.getElementById("open-folder").addEventListener("click", () => {
   document.getElementById("folder-input").click();
 });
@@ -1532,13 +1913,23 @@ document.getElementById("folder-input").addEventListener("change", (event) => {
 document.getElementById("clear-folder").addEventListener("click", () => {
   loadedImport = null;
   setFolderLabel();
+  clearSampleSelection();
 });
 document.getElementById("live-code").addEventListener("click", toggleLiveCode);
-document.getElementById("trajectory").addEventListener("click", toggleTrajectory);
+document.getElementById("commit").addEventListener("click", openCommit);
+document.getElementById("revert").addEventListener("click", openRevert);
+document.getElementById("commit-confirm").addEventListener("change", (event) => {
+  document.getElementById("commit-save").disabled = !event.target.checked;
+});
+document.getElementById("commit-dismiss").addEventListener("click", closeCommit);
+document.getElementById("commit-form").addEventListener("submit", saveCommit);
+document.getElementById("commit-llm").addEventListener("click", resolveCommit);
+document.getElementById("trajectory").addEventListener("click", (event) => {
+  if (event.currentTarget.getAttribute("aria-disabled") === "true") event.preventDefault();
+});
 document.getElementById("trajectory-close").addEventListener("click", () => {
-  trajectoryOpen = false;
-  document.getElementById("trajectory").setAttribute("aria-pressed", "false");
-  document.getElementById("trajectory-panel").hidden = true;
+  if (selected) location.href = "/#" + selected;
+  else location.href = "/";
 });
 document.getElementById("kill-backend").addEventListener("click", async () => {
   try {
@@ -1554,6 +1945,11 @@ document.getElementById("tool-only").addEventListener("change", (event) => {
   renderTimeline();
 });
 sessionsEl.addEventListener("click", (event) => {
+  const cancel = event.target.closest("button[data-cancel]");
+  if (cancel) {
+    cancelSession(cancel.dataset.cancel);
+    return;
+  }
   const button = event.target.closest("button[data-session]");
   if (button) selectSession(button.dataset.session);
 });
@@ -1571,11 +1967,15 @@ renderChanged();
 renderTimeline();
 renderHosts();
 openGlobalStream();
-refreshSessions().then(() => {
-  const hash = location.hash.replace(/^#/, "");
-  if (hash) selectSession(hash);
+refreshSessions().then(async () => {
+  const pathId = trajectoryIdFromPath();
+  const id = pathId || location.hash.replace(/^#/, "");
+  if (!id) return;
+  await selectSession(id);
+  if (pathId && pathId === selected) showTrajectory();
 });
 refreshHosts();
+refreshHistory();
 pollSupervisor();
 setInterval(() => {
   renderElapsed();

@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   final_answer      TEXT,
   error             TEXT,
   import_id         TEXT,
+  base_fingerprint  TEXT,
   created_at        REAL NOT NULL,
   updated_at        REAL NOT NULL
 );
@@ -108,3 +109,5 @@ def _migrate(conn: sqlite3.Connection) -> None:
     columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")}
     if "import_id" not in columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN import_id TEXT")
+    if "base_fingerprint" not in columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN base_fingerprint TEXT")

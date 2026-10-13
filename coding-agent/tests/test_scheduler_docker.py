@@ -101,6 +101,9 @@ def test_killed_host_is_replaced_at_generation_2(tmp_path: Path, caplog: pytest.
             subprocess.run(["docker", "kill", "coding-agent-host-a"], env=env, check=True, capture_output=True)
             with caplog.at_level(logging.INFO, logger="backend.scheduler"):
                 await scheduler.report_failure("host-a")
+                await scheduler.report_failure("host-a")
+                await scheduler.report_failure("host-a")
+                await asyncio.gather(*scheduler._recovery)
             host = store.get_host("host-a")
             assert host.generation == 2
             assert host.status == "healthy"
