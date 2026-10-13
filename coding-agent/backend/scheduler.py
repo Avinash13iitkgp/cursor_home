@@ -65,6 +65,19 @@ class Scheduler:
         until = self._down_until.get(host_id)
         return until is not None and self._monotonic() < until
 
+    def _arm_restart_hold(self, host_id: str) -> None:
+        """Start the 20s clock once. Later calls do not extend it."""
+        if host_id in self._down_until:
+            return
+        self._down_until[host_id] = self._monotonic() + self._restart_delay()
+
+    async def _wait_restart_hold(self, host_id: str) -> None:
+        self._arm_restart_hold(host_id)
+        remaining = self._down_until[host_id] - self._monotonic()
+        if remaining > 0:
+            logger.info("host %s restart held %.0fs", host_id, remaining)
+            await self._sleep(remaining)
+
     def pick_host(self) -> Host | None:
         healthy = [host for host in self.store.list_hosts() if host.status == "healthy"]
         if not healthy:
@@ -79,7 +92,7 @@ class Scheduler:
                 action = await self.observe(host)
                 if action == "replace":
                     self._move_sessions(host.host_id)
-                    self._schedule_replace(host.host_id, self._restart_delay())
+                    self._schedule_replace(host.host_id)
             await self._sleep(self.settings.health_interval_s)
 
     async def observe(self, host: Host) -> str:
@@ -107,8 +120,9 @@ class Scheduler:
         if outcome != "down":
             return outcome
         logger.info("host %s down", host_id)
+        self._arm_restart_hold(host_id)
         self._move_sessions(host_id)
-        self._schedule_replace(host_id, self._restart_delay())
+        self._schedule_replace(host_id)
         return "replace"
 
     async def report_failure(self, host_id: str) -> None:
@@ -126,19 +140,20 @@ class Scheduler:
         self._note_failure(host_id)
 
     async def abandon_host(self, host_id: str) -> None:
-        """A killed host stays down, and its replacement waits out the restart delay."""
-        delay = self._restart_delay()
-        self._down_until[host_id] = self._monotonic() + delay
+        """A killed host stays down. Its container cannot be started again for 20s."""
+        self._arm_restart_hold(host_id)
         if self.store.get_host(host_id).status != "down":
             self.store.force_down(host_id)
             logger.info("host %s down", host_id)
         self._move_sessions(host_id)
-        self._schedule_replace(host_id, delay)
+        self._schedule_replace(host_id)
 
     def _schedule_replace(self, host_id: str, delay_s: float = 0) -> None:
+        del delay_s
         if host_id in self._replacing:
             return
-        task = asyncio.create_task(self.replace_host(host_id, delay_s=delay_s))
+        self._replacing.add(host_id)
+        task = asyncio.create_task(self.replace_host(host_id, claimed=True))
         self._recovery.add(task)
         task.add_done_callback(self._recovery.discard)
 
@@ -163,14 +178,14 @@ class Scheduler:
                 continue
             logger.info("session %s migrated %s -> %s", session.session_id, host_id, peer.host_id)
 
-    async def replace_host(self, host_id: str, delay_s: float = 0) -> None:
-        if host_id in self._replacing:
-            return
-        self._replacing.add(host_id)
+    async def replace_host(self, host_id: str, delay_s: float = 0, claimed: bool = False) -> None:
+        del delay_s
+        if not claimed:
+            if host_id in self._replacing:
+                return
+            self._replacing.add(host_id)
         try:
-            if delay_s > 0:
-                logger.info("host %s staying down for %.0fs", host_id, delay_s)
-                await self._sleep(delay_s)
+            await self._wait_restart_hold(host_id)
             host = self.store.get_host(host_id)
             previous_boot = host.boot_id or ""
             self.store.mark_replacing(host_id)

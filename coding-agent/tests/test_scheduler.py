@@ -171,7 +171,7 @@ def test_three_failures_then_replace_bumps_generation(tmp_path: Path, caplog: py
             assert await scheduler.observe(host) == "suspect"
             assert await scheduler.observe(store.get_host("host-a")) == "suspect"
             assert await scheduler.observe(store.get_host("host-a")) == "replace"
-            await scheduler.replace_host("host-a")
+            await asyncio.gather(*scheduler._recovery)
         replaced = store.get_host("host-a")
         assert replaced.generation == 2
         assert replaced.status == "healthy"
