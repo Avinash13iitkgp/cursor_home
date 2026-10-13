@@ -60,6 +60,68 @@ def test_write_is_atomic_and_replace_is_idempotent(tmp_path: Path) -> None:
         run_tool(workspace, "replace_in_file", {"path": "README.md", "old": "e", "new": "E"})
 
 
+def _suite(root: Path, token: str) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "pkg.py").write_text('TOKEN = "%s"\n' % token, encoding="utf-8")
+    tests = root / "tests"
+    tests.mkdir()
+    (tests / "test_token.py").write_text(
+        "import unittest\n"
+        "import pkg\n"
+        "\n"
+        "class TokenTests(unittest.TestCase):\n"
+        "    def test_token(self):\n"
+        '        self.assertEqual(pkg.TOKEN, "session")\n',
+        encoding="utf-8",
+    )
+
+
+def test_run_tests_executes_the_session_workspace(tmp_path: Path) -> None:
+    baseline = tmp_path / "base" / "dummy-repo"
+    session = tmp_path / "sessions" / "s_one" / "workspace"
+    _suite(baseline, "baseline")
+    _suite(session, "session")
+    result = run_tool(session, "run_tests", {"pattern": "test_token.py"})
+    assert result.startswith("session workspace: passed exit=0 path=tests")
+    assert 'TOKEN = "baseline"\n' == (baseline / "pkg.py").read_text(encoding="utf-8")
+    assert 'TOKEN = "session"\n' == (session / "pkg.py").read_text(encoding="utf-8")
+
+
+def test_run_tests_baseline_target_uses_the_base_snapshot(tmp_path: Path) -> None:
+    baseline = tmp_path / "base" / "dummy-repo"
+    session = tmp_path / "sessions" / "s_one" / "workspace"
+    _suite(baseline, "baseline")
+    _suite(session, "session")
+    base_result = run_tool(session, "run_tests", {"target": "baseline", "pattern": "test_token.py"})
+    session_result = run_tool(session, "run_tests", {"target": "workspace", "pattern": "test_token.py"})
+    assert base_result.startswith("baseline: failed exit=1 path=tests")
+    assert "'baseline' != 'session'" in base_result
+    assert session_result.startswith("session workspace: passed exit=0 path=tests")
+    assert 'TOKEN = "baseline"\n' == (baseline / "pkg.py").read_text(encoding="utf-8")
+    assert 'TOKEN = "session"\n' == (session / "pkg.py").read_text(encoding="utf-8")
+
+
+def test_run_tests_reports_failures_and_refuses_the_baseline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    session = tmp_path / "sessions" / "s_one" / "workspace"
+    _suite(session, "baseline")
+    failed = run_tool(session, "run_tests", {})
+    assert failed.startswith("session workspace: failed exit=1 path=tests")
+    assert "AssertionError" in failed
+    baseline = tmp_path / "base" / "dummy-repo"
+    baseline.mkdir(parents=True)
+    with pytest.raises(ToolError, match="baseline"):
+        run_tool(baseline, "run_tests", {})
+    seed = tmp_path / "opt" / "dummy-repo"
+    seed.mkdir(parents=True)
+    monkeypatch.setenv("DUMMY_REPO", str(seed))
+    with pytest.raises(ToolError, match="baseline"):
+        run_tool(seed, "run_tests", {})
+    with pytest.raises(ToolError, match="pattern"):
+        run_tool(session, "run_tests", {"pattern": "tests/test_token.py"})
+    with pytest.raises(ToolError, match="escapes"):
+        run_tool(session, "run_tests", {"path": "../s_one"})
+
+
 def test_mkdir_and_delete_are_idempotent(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     assert "created" in run_tool(workspace, "mkdir", {"path": "nested/dir"})

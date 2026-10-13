@@ -1,4 +1,4 @@
-"""File tools confined to one session workspace."""
+"""Workspace tools confined to one session workspace."""
 
 from __future__ import annotations
 
@@ -6,6 +6,9 @@ import fnmatch
 import os
 import re
 import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -13,6 +16,9 @@ from daemon.fsutil import atomic_write
 
 MAX_HITS = 200
 MAX_READ_LINES = 4000
+MAX_TEST_OUTPUT = 16000
+TEST_TIMEOUT_S = 45
+_TEST_PATTERN = re.compile(r"[A-Za-z0-9_.*?-]+")
 
 
 class ToolError(Exception):
@@ -96,6 +102,33 @@ def tool_specs() -> list[dict[str, Any]]:
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"],
+            },
+        },
+        {
+            "name": "run_tests",
+            "description": (
+                "Run unittest discover. "
+                "target workspace (the default) uses this session's workspace: the base snapshot plus this session's edits. "
+                "target baseline uses the unmodified base snapshot, so you can see which failures already exist there. "
+                "A failing suite still returns the test output."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "enum": ["workspace", "baseline"],
+                        "description": "workspace runs the session tree. baseline runs the unmodified base snapshot. Defaults to workspace.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Test directory relative to the selected tree. Defaults to tests.",
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": "File glob passed to unittest discover. Defaults to test*.py.",
+                    },
+                },
             },
         },
     ]
@@ -257,6 +290,100 @@ def _mkdir(workspace: Path, arguments: dict[str, Any]) -> str:
     return "exists %s" % path.name if existed else "created %s" % path.name
 
 
+def _run_tests(workspace: Path, arguments: dict[str, Any]) -> str:
+    root = workspace.resolve()
+    target = arguments.get("target", "workspace")
+    if not isinstance(target, str) or target not in ("workspace", "baseline"):
+        raise ToolError("target must be workspace or baseline")
+    if target == "baseline":
+        source = _baseline_dir(root)
+        with tempfile.TemporaryDirectory(prefix="baseline-tests-") as tmp:
+            dest = Path(tmp) / "tree"
+            shutil.copytree(source, dest, symlinks=True, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            return _execute_suite(dest, arguments, "baseline")
+    if _is_baseline(root):
+        raise ToolError("pass target baseline to run the base snapshot")
+    return _execute_suite(root, arguments, "session workspace")
+
+
+def _execute_suite(root: Path, arguments: dict[str, Any], label: str) -> str:
+    root = root.resolve()
+    raw_path = arguments.get("path", "tests")
+    if not isinstance(raw_path, str):
+        raise ToolError("path must be a string")
+    start = confine(root, raw_path)
+    if not start.is_dir():
+        raise ToolError("test directory not found")
+    pattern = arguments.get("pattern", "test*.py")
+    if not isinstance(pattern, str) or not _TEST_PATTERN.fullmatch(pattern):
+        raise ToolError("pattern must be a file glob")
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    env.pop("PYTHONPATH", None)
+    # The start directory is the top-level directory, so tests/ does not need
+    # __init__.py. cwd is the selected tree, so imports resolve inside it.
+    command = [
+        sys.executable,
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        start.relative_to(root).as_posix(),
+        "-p",
+        pattern,
+        "-v",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=TEST_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = "%s%s" % (exc.stdout or "", exc.stderr or "")
+        raise ToolError("tests timed out after %ss\n%s" % (TEST_TIMEOUT_S, _clip(partial))) from exc
+    output = _clip("%s%s" % (completed.stdout or "", completed.stderr or ""))
+    no_tests = "Ran 0 tests" in output or "NO TESTS RAN" in output
+    if completed.returncode == 0 and not no_tests:
+        status, code = "passed", 0
+    else:
+        status, code = "failed", completed.returncode or 5
+    relative = start.relative_to(root).as_posix()
+    return "%s: %s exit=%s path=%s\n%s" % (label, status, code, relative, output)
+
+
+def _baseline_dir(workspace: Path) -> Path:
+    if workspace.name == "workspace" and len(workspace.parents) >= 3 and workspace.parents[1].name == "sessions":
+        candidate = workspace.parents[2] / "base" / "dummy-repo"
+        if candidate.is_dir():
+            return candidate
+    raise ToolError("baseline snapshot is not available")
+
+
+def _is_baseline(path: Path) -> bool:
+    if path.name == "dummy-repo" and path.parent.name == "base":
+        return True
+    dummy = os.environ.get("DUMMY_REPO")
+    if not dummy:
+        return False
+    try:
+        return path == Path(dummy).resolve()
+    except OSError:
+        return False
+
+
+def _clip(text: str) -> str:
+    if len(text) <= MAX_TEST_OUTPUT:
+        return text
+    omitted = len(text) - MAX_TEST_OUTPUT
+    return "... %s characters omitted ...\n%s" % (omitted, text[-MAX_TEST_OUTPUT:])
+
+
 def _delete_path(workspace: Path, arguments: dict[str, Any]) -> str:
     path = confine(workspace, arguments.get("path"))
     if path == workspace.resolve():
@@ -295,5 +422,6 @@ _FUNCS.update(
         "replace_in_file": _replace_in_file,
         "mkdir": _mkdir,
         "delete_path": _delete_path,
+        "run_tests": _run_tests,
     }
 )

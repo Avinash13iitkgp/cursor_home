@@ -11,7 +11,7 @@ These rules keep the separation clean and the code small.
 3. **Commit before side effect.** The backend writes the intent to SQLite before calling the model or a tool, and writes the result in the same transaction that advances the step.
 4. **Every remote call carries a deterministic id.** Session creation uses an `Idempotency-Key`. Tool calls use `op_id = {session_id}.{step}.{call_index}`. Retrying any call with the same id is safe.
 5. **No in-memory state that matters.** Kill any process at any line; on restart, state is rebuilt from SQLite and `data/cow/`.
-6. **Minimal dependencies.** Backend: FastAPI, uvicorn, httpx. Daemon: Python stdlib only (the [Dockerfile](Dockerfile) installs nothing with pip). UI: one HTML file, vanilla JS, no build step.
+6. **Minimal dependencies.** Backend: FastAPI, uvicorn, httpx. The daemon process is Python stdlib only. The [Dockerfile](Dockerfile) still installs a C toolchain and pytest, from [image-requirements.txt](image-requirements.txt), so a workspace can compile extensions, run Python, and run tests with `unittest` or `pytest`. UI: one HTML file, vanilla JS, no build step.
 
 ## Component breakdown
 
@@ -199,7 +199,7 @@ CREATE INDEX IF NOT EXISTS events_session_seq ON events(session_id, seq);
   - `tools/list` returns `{tools: [{name, description, inputSchema}]}`
   - `tools/call` with `{name, arguments, _meta: {session_id, op_id}}` returns `{content: [{type: "text", text}], isError, _meta: {op_id, replayed, host_id, boot_id}}`
 
-### Tools (file operations only, all confined to the session workspace)
+### Tools (confined to the session workspace)
 
 - `list_dir(path=".", depth=1)`
 - `read_file(path, start_line?, end_line?)`
@@ -208,6 +208,7 @@ CREATE INDEX IF NOT EXISTS events_session_seq ON events(session_id, seq);
 - `replace_in_file(path, old, new)` requires `old` to appear exactly once. If `old` is gone and `new` is present, it reports `already_applied` so a re-run after a crash still succeeds.
 - `mkdir(path)` uses `exist_ok`.
 - `delete_path(path)` treats "already absent" as success.
+- `run_tests(target="workspace", path="tests", pattern="test*.py")` runs `python -m unittest discover`. `workspace` (the default) uses the session workspace, which is the base snapshot plus that session's edits. `baseline` runs a copy of `base/dummy-repo` so the suite shows failures that already exist in the unmodified snapshot, and the run does not write into that snapshot. A failing suite returns the output as a normal tool result. The same `op_id` replays the stored output.
 
 Paths are confined with `realpath(workspace / p)`, which must start with `realpath(workspace) + "/"`. Writes go through `fsutil.atomic_write`: write `path.tmp-<uuid>`, fsync, `os.replace`, fsync parent dir. No tool ever opens an existing file for in-place writing, and that is what makes the copy-on-write below correct.
 
@@ -441,5 +442,5 @@ Each step ends in something that runs. Time estimates add up to about 3 h 50 m.
 
 ## Out of scope for the prototype
 - Auth, multi-user isolation, remote hosts, S3, Redis gateway, and a separate scheduler service (all on the whiteboard; the backend does the scheduler's job in-process here).
-- Shell or test-execution tools in the daemon, which only does file operations.
+- A general shell in the daemon. `run_tests` runs the session workspace suite only and does not take a command.
 - Per-step snapshots and rollback, not needed given atomic writes and the op journal.
