@@ -40,6 +40,9 @@ class Settings:
     backend_port: int
     supervisor_port: int
     max_steps: int
+    max_model_retries: int
+    max_host_retries: int
+    host_give_up_s: float
     lease_ttl_s: float
     lease_renew_s: float
     migrate_after_s: float
@@ -86,7 +89,10 @@ def load_settings(
         daemon_image=_pick(values, "DAEMON_IMAGE", "coding-agent-daemon:local"),
         backend_port=_integer(values, "BACKEND_PORT", 8080),
         supervisor_port=_integer(values, "SUPERVISOR_PORT", 8090),
-        max_steps=_integer(values, "MAX_STEPS", _integer(values, "MAX_ROUNDS", 30)),
+        max_steps=_integer(values, "MAX_STEPS", _integer(values, "MAX_ROUNDS", 200)),
+        max_model_retries=_integer(values, "MAX_MODEL_RETRIES", 5),
+        max_host_retries=_integer(values, "MAX_HOST_RETRIES", 5),
+        host_give_up_s=_number(values, "HOST_GIVE_UP_S", 60),
         lease_ttl_s=_number(values, "LEASE_TTL_S", 10),
         lease_renew_s=_number(values, "LEASE_RENEW_S", 3),
         migrate_after_s=_number(values, "MIGRATE_AFTER_S", 20),

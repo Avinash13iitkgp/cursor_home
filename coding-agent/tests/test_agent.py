@@ -31,6 +31,9 @@ def _settings(tmp_path: Path, max_steps: int = 30) -> Settings:
         backend_port=8080,
         supervisor_port=8090,
         max_steps=max_steps,
+        max_model_retries=5,
+        max_host_retries=5,
+        host_give_up_s=60,
         lease_ttl_s=10,
         lease_renew_s=3,
         migrate_after_s=20,
@@ -277,6 +280,66 @@ def test_model_retry_discards_the_failed_attempt(tmp_path: Path) -> None:
         assert len(assistants) == 1
         assert any(event.type == "llm.retry" for event in store.events_after(session_id, 0))
         store.close()
+
+    asyncio.run(scenario())
+
+
+def test_repeated_model_failures_stop_the_session(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, events, session_id = _claimed(tmp_path)
+        llm = ScriptedLlm([AssistantTurn("should-not-run", [])], failures=10)
+        agent = Agent(
+            store,
+            events,
+            FakeScheduler(),
+            llm,
+            "owner-a",
+            sleeper=lambda _seconds: _asleep(),
+            max_model_retries=3,
+        )
+        await agent.run(session_id)
+        session = store.get_session(session_id)
+        assert session.status == "failed"
+        assert session.error == "model unreachable after 3 retries: http 503"
+        assert llm.calls == 3
+        store.close()
+
+    async def _asleep() -> None:
+        return None
+
+    asyncio.run(scenario())
+
+
+def test_host_that_never_returns_stops_the_session(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, events, session_id = _claimed(tmp_path)
+        llm = ScriptedLlm([AssistantTurn("", [ModelToolCall("c1", "read_file", '{"path":"README.md"}')])])
+        scheduler = FakeScheduler()
+        scheduler.failures_left = 1
+
+        async def stuck(session_id: str) -> HostAssignment:
+            del session_id
+            await asyncio.sleep(30)
+            return scheduler.assignment
+
+        scheduler.wait_for_host = stuck  # type: ignore[method-assign]
+        agent = Agent(
+            store,
+            events,
+            scheduler,
+            llm,
+            "owner-a",
+            sleeper=lambda _seconds: _asleep(),
+            host_give_up_s=0.05,
+        )
+        await agent.run(session_id)
+        session = store.get_session(session_id)
+        assert session.status == "failed"
+        assert session.error == "host unreachable after waiting 0.05s"
+        store.close()
+
+    async def _asleep() -> None:
+        return None
 
     asyncio.run(scenario())
 

@@ -21,7 +21,10 @@ def test_example_file_loads_live_defaults(tmp_path: Path) -> None:
     assert settings.cursor_base_url == "https://api.x.ai/v1"
     assert settings.cursor_model == "grok-4.7"
     assert settings.cursor_api_key == ""
-    assert settings.max_steps == 30
+    assert settings.max_steps == 200
+    assert settings.max_model_retries == 5
+    assert settings.max_host_retries == 5
+    assert settings.host_give_up_s == 60
     assert settings.lease_ttl_s == 10
     assert settings.migrate_after_s == 20
     assert settings.hosts[0].host_id == "host-a"

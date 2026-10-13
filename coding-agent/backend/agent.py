@@ -67,6 +67,9 @@ class Agent:
         llm: Any,
         owner: str,
         sleeper: Sleeper = asyncio.sleep,
+        max_model_retries: int = 5,
+        max_host_retries: int = 5,
+        host_give_up_s: float = 60,
     ) -> None:
         self.store = store
         self.events = events
@@ -74,6 +77,9 @@ class Agent:
         self.llm = llm
         self.owner = owner
         self._sleep = sleeper
+        self.max_model_retries = max_model_retries
+        self.max_host_retries = max_host_retries
+        self.host_give_up_s = host_give_up_s
 
     async def _db(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """SQLite work runs off the event loop so other sessions can keep streaming."""
@@ -86,6 +92,7 @@ class Agent:
             logger.info("session %s lost its lease", session_id)
 
     async def _loop(self, session_id: str) -> None:
+        host_failures = 0
         while True:
             # Reload instead of keeping a step counter in memory. A killed process
             # resumes from the last committed row, not from a lost local variable.
@@ -99,7 +106,7 @@ class Agent:
             calls = await self._db(self.store.tool_calls_for_step, session_id, session.step)
             phase = decide(messages, calls)
             if phase == "tools":
-                await self._run_tools(session, calls)
+                host_failures = await self._run_tools(session, calls, host_failures)
                 continue
             if phase == "advance":
                 await self._db(self.store.advance_step, self.owner, session_id, session.step)
@@ -128,6 +135,11 @@ class Agent:
                 await self._db(self.store.fail_session, self.owner, session.session_id, exc.reason)
                 return
             attempt += 1
+            if attempt >= self.max_model_retries:
+                message = "model unreachable after %s retries: %s" % (attempt, reason)
+                logger.error("session %s %s", session.session_id, message)
+                await self._db(self.store.fail_session, self.owner, session.session_id, message)
+                return
             backoff = min(30, 2 ** (attempt - 1))
             logger.info("session %s llm retry %s in %ss (%s)", session.session_id, attempt, backoff, reason)
             await self._db(self.store.note_llm_retry, self.owner, session.session_id, attempt, reason, backoff)
@@ -154,14 +166,14 @@ class Agent:
             raise LlmRetryable("stream ended without a turn")
         return turn
 
-    async def _run_tools(self, session: Session, calls: list[ToolCall]) -> None:
+    async def _run_tools(self, session: Session, calls: list[ToolCall], host_failures: int) -> int:
         assignment = await self.scheduler.prepare(session.session_id)
         for call in calls:
             if call.status in ("succeeded", "failed"):
                 continue
             current = await self._db(self.store.get_session, session.session_id)
             if current.status in TERMINAL or current.lease_owner != self.owner:
-                return
+                return host_failures
             await self._db(
                 self.store.mark_tool_running,
                 self.owner,
@@ -185,13 +197,29 @@ class Agent:
                     arguments,
                 )
             except HostUnreachable as exc:
+                host_failures += 1
+                if host_failures >= self.max_host_retries:
+                    message = "host unreachable after %s retries: %s" % (host_failures, exc.reason)
+                    logger.error("session %s %s", session.session_id, message)
+                    await self._db(self.store.fail_session, self.owner, session.session_id, message)
+                    return host_failures
                 await self._db(self.store.note_tool_retry, self.owner, session.session_id, call.op_id, exc.reason, 0)
                 await self._db(self.store.set_status, self.owner, session.session_id, "waiting_host")
                 await self.scheduler.report_failure(assignment.host_id)
-                assignment = await self.scheduler.wait_for_host(session.session_id)
+                try:
+                    assignment = await asyncio.wait_for(
+                        self.scheduler.wait_for_host(session.session_id),
+                        timeout=self.host_give_up_s,
+                    )
+                except asyncio.TimeoutError:
+                    message = "host unreachable after waiting %ss" % self.host_give_up_s
+                    logger.error("session %s %s", session.session_id, message)
+                    await self._db(self.store.fail_session, self.owner, session.session_id, message)
+                    return host_failures
                 await self.scheduler.ensure_workspace(assignment.endpoint, session.session_id)
                 await self._db(self.store.set_status, self.owner, session.session_id, "running")
-                return
+                return host_failures
+            host_failures = 0
             await self._db(
                 self.store.finish_tool,
                 self.owner,
@@ -201,3 +229,4 @@ class Agent:
                 is_error=result.is_error,
                 replayed=result.replayed,
             )
+        return host_failures
