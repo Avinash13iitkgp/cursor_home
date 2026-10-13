@@ -43,37 +43,50 @@ cow_root="$(abs_path "$(env_value COW_ROOT data/cow)")"
 db_path="$(abs_path "$(env_value DB_PATH data/agent.db)")"
 imports_root="$(dirname "$cow_root")/imports"
 
-pids_on_port() {
-  lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null || true
-}
-
-port_open() {
-  [[ -n "$(pids_on_port "$1")" ]]
+backend_pids() {
+  # Listeners, plus a backend the supervisor already orphaned. That process
+  # keeps the SQLite file open and keeps serving browser tabs that are already
+  # connected, even after it drops its listen socket.
+  local pid command
+  while read -r pid command; do
+    case "$command" in
+      *backend.supervisor*|*uvicorn\ backend.api:app*)
+        printf '%s\n' "$pid"
+        ;;
+    esac
+  done < <(ps -axo pid=,command=)
+  lsof -nP -iTCP:"$backend_port" -sTCP:LISTEN -t 2>/dev/null || true
+  lsof -nP -iTCP:"$supervisor_port" -sTCP:LISTEN -t 2>/dev/null || true
 }
 
 stop_backend() {
-  if ! port_open "$backend_port" && ! port_open "$supervisor_port"; then
+  local pids pid
+  pids="$(backend_pids)"
+  if [[ -z "$pids" ]]; then
     return 0
   fi
   echo "Stopping the backend and supervisor..."
-  local attempt pid
-  for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    # The supervisor restarts a dead backend, so it has to go first.
-    for pid in $(pids_on_port "$supervisor_port"); do
+  # Supervisor first: if it is still alive it restarts the backend.
+  for pid in $pids; do
+    if ps -p "$pid" -o command= 2>/dev/null | grep -q 'backend.supervisor'; then
       kill -KILL "$pid" 2>/dev/null || true
-    done
-    for pid in $(pids_on_port "$backend_port"); do
-      kill -KILL "$pid" 2>/dev/null || true
-    done
-    if ! port_open "$backend_port" && ! port_open "$supervisor_port"; then
-      sleep 0.4
-      if ! port_open "$backend_port" && ! port_open "$supervisor_port"; then
-        return 0
-      fi
     fi
+  done
+  for pid in $pids; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    pids="$(backend_pids)"
+    if [[ -z "$pids" ]]; then
+      return 0
+    fi
+    for pid in $pids; do
+      kill -KILL "$pid" 2>/dev/null || true
+    done
     sleep 0.2
   done
-  echo "The backend is still listening on port ${backend_port} or ${supervisor_port}." >&2
+  echo "The backend is still running." >&2
   exit 1
 }
 
