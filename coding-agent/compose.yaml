@@ -1,0 +1,70 @@
+# Local daemon hosts. The ReAct backend and the UI run on the Mac, outside
+# Compose, so the backend process can die and come back without taking the
+# workspaces with it.
+#
+# restart is "no" on purpose. A killed host must stay down so the backend can
+# start a new container against the same Mac snapshot directory. Compose would
+# otherwise restart the old container and hide the failover.
+name: coding-agent
+
+services:
+  host-a:
+    image: coding-agent-daemon:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: coding-agent-host-a
+    restart: "no"
+    ports:
+      - "127.0.0.1:7701:7700"
+    environment:
+      HOST_ID: host-a
+      COW_ROOT: /cow
+      DUMMY_REPO: /opt/dummy-repo
+      PORT: "7700"
+    volumes:
+      # Bind mount, not a named volume: the base snapshot has to live on a
+      # specific directory on this Mac so a replacement container can attach
+      # to the same files after the old container is gone.
+      - ${COW_ROOT:-./data/cow}:/cow
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7700/health', timeout=2).read()",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  host-b:
+    image: coding-agent-daemon:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: coding-agent-host-b
+    restart: "no"
+    ports:
+      - "127.0.0.1:7702:7700"
+    environment:
+      HOST_ID: host-b
+      COW_ROOT: /cow
+      DUMMY_REPO: /opt/dummy-repo
+      PORT: "7700"
+    volumes:
+      - ${COW_ROOT:-./data/cow}:/cow
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7700/health', timeout=2).read()",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
