@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 FROM python:3.12.15-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -8,21 +6,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DUMMY_REPO=/opt/dummy-repo \
     HOST_ID=daemon \
     PORT=7700 \
-    HOME=/home/daemon
+    HOME=/home/agent
 
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends git
-
-RUN groupadd --system --gid 1000 daemon \
-    && useradd --system --uid 1000 --gid daemon --home-dir /home/daemon --create-home daemon
+RUN groupadd --system --gid 1000 agent \
+    && useradd --system --uid 1000 --gid agent --home-dir /home/agent --create-home agent
 
 WORKDIR /app
-COPY --link daemon /app/daemon
-COPY --link dummy-repo /opt/dummy-repo
-RUN chown -R daemon:daemon /app /opt/dummy-repo
+COPY daemon /app/daemon
+COPY dummy-repo /opt/dummy-repo
+RUN chown -R agent:agent /app /opt/dummy-repo
 
-USER daemon
+USER agent
 
 EXPOSE 7700
 

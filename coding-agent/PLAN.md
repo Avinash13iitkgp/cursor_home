@@ -216,7 +216,7 @@ Paths are confined with `realpath(workspace / p)`, which must start with `realpa
 ```
 data/cow/
   base/
-    dummy-repo/            immutable base snapshot (git repo, 1 commit)
+    dummy-repo/            immutable base snapshot (plain directory copy)
     .ready                 {"version": 1, "created_at": ...}
   sessions/<session_id>/
     workspace/             session copy, the only tree tools touch
@@ -224,7 +224,7 @@ data/cow/
     ops/<op_id>.json       journaled tool results
 ```
 
-- **Base seeding on daemon boot.** If `base/.ready` is missing, copy `/opt/dummy-repo` into `base/.tmp-<uuid>/dummy-repo`, run `git init` and an initial commit, fsync, then `os.rename` the tmp dir to `base/`. If two daemons race, the loser's rename fails because the target exists; it deletes its tmp dir and uses the winner's base. This is the daemon's "download and set up" step. `DUMMY_REPO_URL`, if set, is used with `git clone` instead of the local copy.
+- **Base seeding on daemon boot.** If `base/.ready` is missing, copy `/opt/dummy-repo` into a temp directory on the Mac mount, fsync, then `os.rename` it to `base/`. No git init and no clone. The image already contains the seed tree; the daemon's job is to place that tree on the Mac directory. A second daemon finds `.ready` and leaves the snapshot alone. An incomplete base (crash mid-copy) is deleted and copied again.
 - **Session ensure.** If `sessions/<id>/.ready` exists, return `created=false`. Otherwise delete any leftover `workspace/` or `.tmp-*`, build the copy in a tmp dir with `link_copy_tree` (hardlink every file with `os.link`, falling back to `shutil.copy2` if the mount refuses hardlinks), rename it to `workspace/`, then write `.ready`.
 - **Why that is copy-on-write.** Session files start as hardlinks to base inodes. Every write is `atomic_write` and `os.replace`, which gives the path a new inode and leaves the base inode untouched. The base stays immutable, and unchanged files cost nothing extra to store.
 - No per-step snapshot directories are made. The workspace is already persisted on the Mac, every write is atomic, and every op is journaled, so a dead host loses nothing that a snapshot would have saved.
