@@ -36,6 +36,7 @@ class ModelToolCall:
 class AssistantTurn:
     content: str
     tool_calls: list[ModelToolCall]
+    reasoning: str = ""
 
 
 @dataclass(frozen=True)
@@ -48,9 +49,12 @@ class StreamEvent:
 @dataclass
 class TurnBuilder:
     content: list[str] = field(default_factory=list)
+    reasoning: list[str] = field(default_factory=list)
     calls: dict[int, dict[str, str]] = field(default_factory=dict)
+    last_reasoning: str = ""
 
     def apply(self, payload: dict[str, Any]) -> str:
+        self.last_reasoning = ""
         if payload.get("done"):
             return ""
         choices = payload.get("choices") or []
@@ -60,6 +64,10 @@ class TurnBuilder:
         text = delta.get("content") or ""
         if text:
             self.content.append(str(text))
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+        if reasoning:
+            self.last_reasoning = str(reasoning)
+            self.reasoning.append(self.last_reasoning)
         for tool_call in delta.get("tool_calls") or []:
             if not isinstance(tool_call, dict):
                 continue
@@ -84,7 +92,11 @@ class TurnBuilder:
             )
             for index in sorted(self.calls)
         ]
-        return AssistantTurn(content="".join(self.content), tool_calls=tool_calls)
+        return AssistantTurn(
+            content="".join(self.content),
+            tool_calls=tool_calls,
+            reasoning="".join(self.reasoning),
+        )
 
 
 def parse_sse_data(line: str) -> dict[str, Any] | None:
@@ -147,6 +159,8 @@ class GrokClient:
                     if payload.get("done"):
                         break
                     text = builder.apply(payload)
+                    if builder.last_reasoning:
+                        yield StreamEvent(kind="reasoning", text=builder.last_reasoning)
                     if text:
                         yield StreamEvent(kind="text", text=text)
         except LlmRetryable:

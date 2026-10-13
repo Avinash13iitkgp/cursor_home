@@ -37,6 +37,7 @@
         </div>
         <div class="session-actions">
           <button type="button" id="live-code" aria-pressed="false" disabled>Live code</button>
+          <button type="button" id="trajectory" aria-pressed="false" disabled>Trajectory</button>
           <button type="button" id="cancel" disabled>Cancel</button>
         </div>
       </header>
@@ -64,6 +65,13 @@
           <h2>Timeline</h2>
           <label class="filter"><input id="tool-only" type="checkbox"> Tool events only</label>
         </div>
+        <div id="timeline-detail" class="timeline-detail" hidden>
+          <p id="timeline-detail-title" class="timeline-detail-title"></p>
+          <p class="timeline-detail-label">Request</p>
+          <pre id="timeline-detail-request"></pre>
+          <p class="timeline-detail-label">Response</p>
+          <pre id="timeline-detail-response"></pre>
+        </div>
         <div id="timeline" class="timeline"></div>
       </div>
       <div>
@@ -72,6 +80,13 @@
       </div>
     </section>
   </main>
+  <section id="trajectory-panel" class="trajectory" hidden>
+    <header class="trajectory-bar">
+      <h2 id="trajectory-title">Trajectory</h2>
+      <button type="button" id="trajectory-close">Close</button>
+    </header>
+    <div id="trajectory-body" class="trajectory-body"></div>
+  </section>
   <script src="/app.js"></script>
 </body>
 </html>

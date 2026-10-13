@@ -554,7 +554,15 @@ class Store:
         )
         return [_tool(row) for row in rows]
 
-    def commit_model_turn(self, owner: str, session_id: str, step: int, content: str | None, calls: list[ModelCall]) -> None:
+    def commit_model_turn(
+        self,
+        owner: str,
+        session_id: str,
+        step: int,
+        content: str | None,
+        calls: list[ModelCall],
+        reasoning: str = "",
+    ) -> None:
         now = time.time()
         with self._tx() as conn:
             self._require_lease(conn, owner, session_id)
@@ -579,6 +587,7 @@ class Store:
                 payload={
                     "step": step,
                     "content": content or "",
+                    "reasoning": reasoning or "",
                     "tool_calls": json.loads(tool_calls_json) if tool_calls_json else [],
                 },
             )
@@ -762,15 +771,21 @@ class Store:
             self._require_lease(conn, owner, session_id)
             self._event(conn, session_id=session_id, type="llm.started", payload={"step": step})
 
-    def note_llm_retry(self, owner: str, session_id: str, attempt: int, reason: str, backoff_s: float) -> None:
+    def note_llm_retry(
+        self,
+        owner: str,
+        session_id: str,
+        attempt: int,
+        reason: str,
+        backoff_s: float,
+        step: int | None = None,
+    ) -> None:
         with self._tx() as conn:
             self._require_lease(conn, owner, session_id)
-            self._event(
-                conn,
-                session_id=session_id,
-                type="llm.retry",
-                payload={"attempt": attempt, "reason": reason, "backoff_s": backoff_s},
-            )
+            payload: dict[str, Any] = {"attempt": attempt, "reason": reason, "backoff_s": backoff_s}
+            if step is not None:
+                payload["step"] = step
+            self._event(conn, session_id=session_id, type="llm.retry", payload=payload)
 
     def append_event(
         self,

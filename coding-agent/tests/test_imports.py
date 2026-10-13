@@ -6,7 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from backend.imports import ImportError, load_import, materialize_import, read_workspace_file, save_import
+from backend.imports import (
+    ImportError,
+    import_tree,
+    list_workspace_files,
+    load_import,
+    materialize_import,
+    read_workspace_file,
+    save_import,
+)
 from daemon.workspace import ensure_session, seed_base
 
 DUMMY = Path(__file__).resolve().parents[1] / "dummy-repo"
@@ -30,3 +38,19 @@ def test_import_is_materialized_and_kept_by_ensure(tmp_path: Path) -> None:
     assert read_workspace_file(cow, "s_loaded", "pkg/hello.py") == "print('loaded')\n"
     with pytest.raises(ImportError):
         read_workspace_file(cow, "s_loaded", "../secret")
+
+
+def test_bundled_dummy_repo_keeps_every_text_file(tmp_path: Path) -> None:
+    cow = tmp_path / "cow"
+    saved = import_tree(cow, "dummy-repo", DUMMY)
+    paths = saved["files"]
+    assert "README.md" in paths
+    assert "TASK.md" in paths
+    assert "inventory/store.py" in paths
+    assert "inventory/cli.py" in paths
+    assert "inventory/report.py" in paths
+    assert "tests/test_store.py" in paths
+    assert len(paths) >= 10
+    materialize_import(cow, "s_all", str(saved["import_id"]))
+    listed = [item["path"] for item in list_workspace_files(cow, "s_all")]
+    assert listed == sorted(paths)

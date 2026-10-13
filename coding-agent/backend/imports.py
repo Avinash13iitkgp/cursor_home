@@ -70,6 +70,23 @@ def save_import(cow_root: Path, name: str, files: list[dict[str, str]]) -> dict[
     return {"import_id": import_id, "name": label, "files": paths}
 
 
+def import_tree(cow_root: Path, name: str, source: Path) -> dict[str, object]:
+    """Stage every text file under source. Used for the bundled dummy repo."""
+    if not source.is_dir():
+        raise ImportError("folder not found")
+    files: list[dict[str, str]] = []
+    for path, content in _walk_text(source):
+        files.append({"path": path, "content": content})
+    return save_import(cow_root, name, files)
+
+
+def list_workspace_files(cow_root: Path, session_id: str) -> list[dict[str, str]]:
+    root = cow_root / "sessions" / session_id / "workspace"
+    if not root.is_dir():
+        return []
+    return [{"path": path, "content": content} for path, content in _walk_text(root)]
+
+
 def load_import(cow_root: Path, import_id: str) -> dict[str, object]:
     _check_id(import_id)
     manifest = imports_root(cow_root) / import_id / "manifest.json"
@@ -125,6 +142,27 @@ def read_workspace_file(cow_root: Path, session_id: str, relative: str) -> str:
     if not target.is_file():
         raise ImportError("file not found")
     return target.read_text(encoding="utf-8")
+
+
+def _walk_text(root: Path) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    base = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [name for name in dirnames if name not in SKIP_DIRS and not name.startswith(".")]
+        for name in sorted(filenames):
+            if name.startswith("."):
+                continue
+            path = Path(dirpath) / name
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (UnicodeError, OSError):
+                continue
+            if "\x00" in content:
+                continue
+            relative = path.resolve().relative_to(base).as_posix()
+            found.append((relative, content))
+    found.sort(key=lambda item: item[0])
+    return found
 
 
 def _relative(raw: object) -> str:

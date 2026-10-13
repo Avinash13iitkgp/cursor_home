@@ -8,6 +8,7 @@ const EVENT_TYPES = [
   "llm.retry",
   "assistant.message",
   "assistant.delta",
+  "assistant.reasoning",
   "tool.pending",
   "tool.started",
   "tool.succeeded",
@@ -45,6 +46,7 @@ const finalEl = document.getElementById("final");
 
 const cards = new Map();
 const cardsBySlot = new Map();
+const slotArgs = new Map();
 const counted = new Set();
 const changed = new Map();
 const applied = new Set();
@@ -56,6 +58,12 @@ let hosts = [];
 let selected = "";
 let floor = 0;
 let toolOnly = false;
+let openTimelineSeq = 0;
+let trajectoryOpen = false;
+let sessionMessages = [];
+let liveText = "";
+let liveReasoning = "";
+const toolDetails = new Map();
 let submitKey = "";
 let submitting = false;
 let down = false;
@@ -265,6 +273,7 @@ function renderHeader(session) {
     meta.textContent = "";
     cancel.disabled = true;
     document.getElementById("live-code").disabled = true;
+    document.getElementById("trajectory").disabled = true;
     showFinal({ status: "" });
     return;
   }
@@ -282,6 +291,7 @@ function renderHeader(session) {
   meta.appendChild(elapsed);
   cancel.disabled = TERMINAL.has(session.status);
   document.getElementById("live-code").disabled = false;
+  document.getElementById("trajectory").disabled = false;
   showFinal(session);
 }
 
@@ -289,6 +299,7 @@ function renderSessionList() {
   sessionsEl.replaceChildren();
   if (!sessions.length) {
     emptyNote(sessionsEl, "No tasks yet.");
+    renderHosts();
     return;
   }
   for (const session of sessions) {
@@ -317,6 +328,7 @@ function renderSessionList() {
     button.append(title, row);
     sessionsEl.appendChild(button);
   }
+  renderHosts();
 }
 
 function cardFromRow(call) {
@@ -493,9 +505,88 @@ function renderChanged() {
   }
 }
 
+function rememberTool(opId, partial) {
+  if (!opId) return;
+  const current = toolDetails.get(opId) || { name: "", args: "", result: "", status: "" };
+  if (partial.name) current.name = partial.name;
+  if (partial.args) current.args = partial.args;
+  if (typeof partial.result === "string" && (partial.status === "failed" || partial.result.length >= current.result.length)) {
+    current.result = partial.result;
+  }
+  if (partial.status) current.status = partial.status;
+  toolDetails.set(opId, current);
+}
+
+function rememberCall(call) {
+  let result = "";
+  if (call.result_json) {
+    try {
+      const parsed = JSON.parse(call.result_json);
+      result = parsed && typeof parsed.text === "string" ? parsed.text : "";
+    } catch (_err) {
+      result = "";
+    }
+  }
+  if (call.error) result = call.error;
+  rememberTool(call.op_id, {
+    name: call.tool_name,
+    args: call.args_json,
+    result: result,
+    status: call.status,
+  });
+}
+
+function toolLabel(event) {
+  if (!event.type.startsWith("tool.")) return event.type;
+  const detail = event.op_id ? toolDetails.get(event.op_id) : null;
+  const name = (detail && detail.name) || (event.payload && event.payload.name) || "tool";
+  return name + " · " + event.type.slice("tool.".length);
+}
+
+function prettyArgs(raw) {
+  const parsed = parsedArgs(raw);
+  if (!raw) return "";
+  if (!Object.keys(parsed).length) return String(raw);
+  return JSON.stringify(parsed, null, 2);
+}
+
+function renderTimelineDetail() {
+  const panel = document.getElementById("timeline-detail");
+  const event = timeline.find((item) => item.seq === openTimelineSeq);
+  if (!event || !event.op_id || !event.type.startsWith("tool.")) {
+    panel.hidden = true;
+    return;
+  }
+  const detail = toolDetails.get(event.op_id) || { name: "", args: "", result: "", status: "" };
+  panel.hidden = false;
+  document.getElementById("timeline-detail-title").textContent = toolLabel(event);
+  document.getElementById("timeline-detail-request").textContent = prettyArgs(detail.args) || "(no request yet)";
+  document.getElementById("timeline-detail-response").textContent = detail.result || "(no response yet)";
+}
+
+async function openTimelineEvent(event) {
+  openTimelineSeq = openTimelineSeq === event.seq ? 0 : event.seq;
+  renderTimeline();
+  renderTimelineDetail();
+  if (!openTimelineSeq || !event.op_id || !selected) return;
+  const response = await fetch("/api/sessions/" + encodeURIComponent(selected));
+  if (!response.ok || openTimelineSeq !== event.seq) return;
+  const body = await response.json();
+  const call = (body.tool_calls || []).find((item) => item.op_id === event.op_id);
+  if (call) rememberCall(call);
+  if (openTimelineSeq === event.seq) renderTimelineDetail();
+}
+
 function renderSnapshot(detail) {
   cards.clear();
   cardsBySlot.clear();
+  toolDetails.clear();
+  slotArgs.clear();
+  openTimelineSeq = 0;
+  sessionMessages = detail.messages || [];
+  liveText = "";
+  liveReasoning = "";
+  for (const call of detail.tool_calls || []) rememberCall(call);
   transcriptEl.replaceChildren();
   const byStep = new Map();
   for (const call of detail.tool_calls) {
@@ -538,28 +629,35 @@ function renderTimeline() {
     emptyNote(timelineEl, "No events yet.");
     return;
   }
+  const stick = nearBottom(timelineEl);
   for (const event of rows) {
-    const row = document.createElement("div");
-    row.className = "tl-row";
+    const isTool = event.type.startsWith("tool.") && event.op_id;
+    const row = document.createElement(isTool ? "button" : "div");
+    if (isTool) row.type = "button";
+    row.className = "tl-row" + (isTool ? " tool" : "") + (event.seq === openTimelineSeq ? " open" : "");
     const main = document.createElement("div");
     main.className = "tl-main";
     const time = document.createElement("span");
     time.textContent = formatClock(event.ts);
     const type = document.createElement("span");
     type.className = "type";
-    type.textContent = event.type;
+    type.textContent = toolLabel(event);
     main.append(time, type);
     row.appendChild(main);
-    const extra = [event.op_id, event.host_id].filter(Boolean).join("  ");
+    const extra = [event.host_id].filter(Boolean).join("  ");
     if (extra) {
       const line = document.createElement("div");
       line.className = "tl-extra";
       line.textContent = extra;
       row.appendChild(line);
     }
+    if (isTool) {
+      row.addEventListener("click", () => openTimelineEvent(event));
+    }
     timelineEl.appendChild(row);
   }
-  timelineEl.scrollTop = timelineEl.scrollHeight;
+  if (stick) timelineEl.scrollTop = timelineEl.scrollHeight;
+  renderTimelineDetail();
 }
 
 function rememberTimeline(event) {
@@ -570,10 +668,6 @@ function rememberTimeline(event) {
 
 function bannerText(event) {
   const payload = event.payload || {};
-  if (event.type === "host.down") return (event.host_id || "host") + " down";
-  if (event.type === "host.replaced") {
-    return (event.host_id || "host") + " replaced" + (payload.generation ? " g" + payload.generation : "");
-  }
   if (event.type === "session.migrated") {
     const generation = payload.generation ? " g" + payload.generation : "";
     return "migrated " + (payload.from || "?") + " → " + (payload.to || "?") + generation;
@@ -583,7 +677,6 @@ function bannerText(event) {
 }
 
 function bannerVisible(event) {
-  if (event.type === "host.down" || event.type === "host.replaced") return true;
   if (!selected) return false;
   return event.session_id === selected;
 }
@@ -646,10 +739,13 @@ function applyTranscript(event) {
         args: fn.arguments || "",
         status: "pending",
       });
+      slotArgs.set(slotKey(payload.step, index), { name: fn.name || "tool", args: fn.arguments || "" });
       if (fn.name === "write_file") noteCode(fn.name, fn.arguments || "", "pending");
     });
     const waiting = transcriptEl.querySelector(".empty");
     if (waiting) waiting.remove();
+    liveText = "";
+    liveReasoning = "";
     return;
   }
   if (event.type === "tool.pending") {
@@ -658,6 +754,12 @@ function applyTranscript(event) {
       step: payload.step,
       call_index: payload.call_index,
       name: payload.name,
+      status: "pending",
+    });
+    const staged = slotArgs.get(slotKey(payload.step, payload.call_index)) || {};
+    rememberTool(event.op_id, {
+      name: payload.name || staged.name,
+      args: staged.args || "",
       status: "pending",
     });
     return;
@@ -682,6 +784,12 @@ function applyTranscript(event) {
     });
     noteChanged(state);
     noteCode(state.name, state.args, "succeeded");
+    rememberTool(event.op_id, {
+      name: state.name,
+      args: state.args,
+      status: "succeeded",
+      result: payload.summary || "",
+    });
     return;
   }
   if (event.type === "tool.failed") {
@@ -691,6 +799,12 @@ function applyTranscript(event) {
       result: payload.error || "",
     });
     noteCode(state.name, state.args, "failed");
+    rememberTool(event.op_id, {
+      name: state.name,
+      args: state.args,
+      status: "failed",
+      result: payload.error || state.result || "",
+    });
     return;
   }
   if (event.type === "tool.retrying") {
@@ -705,8 +819,17 @@ function applyTranscript(event) {
 function apply(event) {
   if (!event || !event.type) return;
   event.payload = event.payload || {};
-  if (event.type === "assistant.delta") {
-    if (event.session_id === selected) appendDelta(event.payload.text || "");
+  if (event.type === "assistant.delta" || event.type === "assistant.reasoning") {
+    if (event.session_id === selected) {
+      const text = event.payload.text || "";
+      if (event.type === "assistant.delta") {
+        appendDelta(text);
+        liveText += text;
+      } else {
+        liveReasoning += text;
+      }
+      if (trajectoryOpen) renderTrajectory();
+    }
     return;
   }
   if (!event.seq || applied.has(event.seq)) return;
@@ -719,6 +842,7 @@ function apply(event) {
     scheduleSessionRefresh();
   }
   if (!selected || (event.session_id && event.session_id !== selected)) return;
+  if (trajectoryOpen) renderTrajectory();
   if (event.seq <= floor) return;
   applyTranscript(event);
 }
@@ -726,7 +850,7 @@ function apply(event) {
 function listen(source, options) {
   const includeDeltas = !options || options.deltas !== false;
   for (const type of EVENT_TYPES) {
-    if (type === "assistant.delta" && !includeDeltas) continue;
+    if ((type === "assistant.delta" || type === "assistant.reasoning") && !includeDeltas) continue;
     source.addEventListener(type, (message) => {
       try {
         apply(JSON.parse(message.data));
@@ -784,8 +908,14 @@ function renderHosts() {
     return;
   }
   for (const host of hosts) {
+    const assigned = sessions.filter((session) => {
+      if (session.host_id !== host.host_id) return false;
+      if (session.status === "running" || session.status === "waiting_host") return true;
+      return session.session_id === selected;
+    });
+    const runsSelected = assigned.some((session) => session.session_id === selected);
     const card = document.createElement("article");
-    card.className = "host-card";
+    card.className = "host-card" + (runsSelected ? " running-selected" : assigned.length ? " busy" : "");
     const top = document.createElement("div");
     top.className = "host-top";
     const title = document.createElement("div");
@@ -811,7 +941,26 @@ function renderHosts() {
     kill.className = "danger";
     kill.dataset.kill = host.host_id;
     kill.textContent = "Kill host";
-    card.append(top, meta, kill);
+    card.append(top, meta);
+    if (assigned.length) {
+      const list = document.createElement("div");
+      list.className = "host-sessions";
+      for (const session of assigned) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "host-session" + (session.session_id === selected ? " selected" : "");
+        row.dataset.session = session.session_id;
+        row.textContent = session.title || session.session_id;
+        list.appendChild(row);
+      }
+      card.appendChild(list);
+    } else {
+      const idle = document.createElement("div");
+      idle.className = "host-idle";
+      idle.textContent = "No session";
+      card.appendChild(idle);
+    }
+    card.appendChild(kill);
     hostsEl.appendChild(card);
   }
   renderHeartbeatAges();
@@ -992,7 +1141,12 @@ async function hydrateCode(detail) {
   codeFiles.clear();
   unresolvedFiles.clear();
   openFile = "";
-  if (detail.session.import_id) {
+  const listed = await fetch("/api/sessions/" + encodeURIComponent(detail.session.session_id) + "/files");
+  if (listed.ok) {
+    const body = await listed.json();
+    for (const file of body.files || []) codeFiles.set(file.path, { text: file.content || "", status: "" });
+  }
+  if (!codeFiles.size && detail.session.import_id) {
     const response = await fetch("/api/imports/" + encodeURIComponent(detail.session.import_id));
     if (response.ok) {
       const body = await response.json();
@@ -1001,7 +1155,10 @@ async function hydrateCode(detail) {
   }
   const calls = (detail.tool_calls || []).slice().sort((a, b) => a.step - b.step || a.call_index - b.call_index);
   for (const call of calls) {
-    if (call.status === "succeeded") noteCode(call.tool_name, call.args_json, "succeeded", { fetch: false });
+    if (call.status !== "succeeded" || !MUTATING.has(call.tool_name)) continue;
+    const path = argPath(call.args_json);
+    if (path && codeFiles.has(path)) codeFiles.get(path).status = "updated";
+    else noteCode(call.tool_name, call.args_json, "succeeded", { fetch: false });
   }
   for (const path of unresolvedFiles) await refreshWorkspaceFile(path);
   if (!openFile && codeFiles.size) openFile = Array.from(codeFiles.keys()).sort()[0];
@@ -1035,6 +1192,209 @@ function renderCode() {
   const file = codeFiles.get(openFile);
   status.textContent = openFile + (file.status ? " · " + file.status : "");
   view.textContent = file.status === "deleted" ? "" : file.text;
+}
+
+function formatSpan(start, end) {
+  if (start == null) return "";
+  const stop = end == null ? Date.now() / 1000 : end;
+  return formatDuration(Math.max(0, Math.round((stop - start) * 1000)));
+}
+
+function contextBefore(step) {
+  const assistant = sessionMessages
+    .filter((message) => message.role === "assistant" && message.step === step)
+    .sort((a, b) => a.idx - b.idx)[0];
+  const prior = assistant ? sessionMessages.filter((message) => message.idx < assistant.idx) : sessionMessages;
+  if (!prior.length) return "";
+  return prior
+    .map((message) => message.role + ":\n" + (message.content || ""))
+    .join("\n\n");
+}
+
+function buildTrajectory() {
+  const events = timeline.filter((event) => event.session_id === selected).sort((a, b) => a.seq - b.seq);
+  const steps = [];
+  const byStep = new Map();
+  const tools = new Map();
+  let current = 0;
+
+  function bucket(step) {
+    const key = step == null ? current : step;
+    current = key;
+    if (!byStep.has(key)) {
+      const row = {
+        step: key,
+        started: null,
+        finished: null,
+        retries: [],
+        reasoning: "",
+        content: "",
+        tools: [],
+      };
+      byStep.set(key, row);
+      steps.push(row);
+    }
+    return byStep.get(key);
+  }
+
+  function toolRow(opId, step) {
+    let tool = opId ? tools.get(opId) : null;
+    if (!tool) {
+      tool = { opId: opId || "", name: "tool", args: "", result: "", status: "", started: null, finished: null, attempt: 0, host: "", failures: [] };
+      if (opId) tools.set(opId, tool);
+      bucket(step).tools.push(tool);
+    }
+    return tool;
+  }
+
+  for (const event of events) {
+    const payload = event.payload || {};
+    if (event.type === "llm.started") {
+      const row = bucket(payload.step);
+      if (row.started == null) row.started = event.ts;
+    } else if (event.type === "llm.retry") {
+      bucket(payload.step).retries.push({
+        ts: event.ts,
+        attempt: payload.attempt,
+        reason: payload.reason || "",
+        backoff: payload.backoff_s,
+      });
+    } else if (event.type === "assistant.message") {
+      const row = bucket(payload.step);
+      row.content = payload.content || "";
+      row.reasoning = payload.reasoning || "";
+      row.finished = event.ts;
+    } else if (event.type === "tool.pending") {
+      const tool = toolRow(event.op_id, payload.step);
+      tool.name = payload.name || tool.name;
+      const known = event.op_id ? toolDetails.get(event.op_id) : null;
+      if (known) {
+        tool.name = known.name || tool.name;
+        tool.args = known.args || tool.args;
+        tool.result = known.result || tool.result;
+        tool.status = known.status || tool.status;
+      }
+    } else if (event.type === "tool.started" || event.type === "tool.succeeded" || event.type === "tool.failed" || event.type === "tool.retrying") {
+      const tool = toolRow(event.op_id, null);
+      const known = event.op_id ? toolDetails.get(event.op_id) : null;
+      if (known) {
+        tool.name = known.name || tool.name;
+        tool.args = known.args || tool.args;
+        if (known.result) tool.result = known.result;
+        tool.status = known.status || tool.status;
+      }
+      if (event.type === "tool.started") {
+        tool.started = event.ts;
+        tool.attempt = payload.attempt || tool.attempt;
+        tool.host = payload.host_id || event.host_id || tool.host;
+        tool.status = tool.status || "running";
+      } else if (event.type === "tool.succeeded") {
+        tool.finished = event.ts;
+        tool.status = "succeeded";
+        if (!tool.result && payload.summary) tool.result = payload.summary;
+      } else if (event.type === "tool.failed") {
+        tool.finished = event.ts;
+        tool.status = "failed";
+        tool.failures.push(payload.error || "failed");
+        if (payload.error) tool.result = payload.error;
+      } else if (event.type === "tool.retrying") {
+        tool.failures.push(payload.reason || "retrying");
+        tool.status = "retrying";
+      }
+    }
+  }
+
+  const open = [...byStep.values()].reverse().find((row) => row.started != null && !row.content);
+  if (open && (liveText || liveReasoning)) {
+    open.reasoning = liveReasoning || open.reasoning;
+    open.content = liveText || open.content;
+  } else if ((liveText || liveReasoning) && !steps.length) {
+    steps.push({
+      step: 0,
+      started: null,
+      finished: null,
+      retries: [],
+      reasoning: liveReasoning,
+      content: liveText,
+      tools: [],
+    });
+  }
+  return steps;
+}
+
+function addBlock(parent, title, text) {
+  if (!text) return;
+  const heading = document.createElement("h4");
+  heading.textContent = title;
+  const body = document.createElement("pre");
+  body.textContent = text;
+  parent.append(heading, body);
+}
+
+function renderTrajectory() {
+  const body = document.getElementById("trajectory-body");
+  const title = document.getElementById("trajectory-title");
+  const session = sessions.find((item) => item.session_id === selected);
+  title.textContent = session ? "Trajectory · " + (session.title || session.session_id) : "Trajectory";
+  body.replaceChildren();
+  const steps = buildTrajectory();
+  if (!steps.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = "No model steps yet.";
+    body.appendChild(empty);
+    return;
+  }
+  for (const step of steps) {
+    const card = document.createElement("article");
+    card.className = "step-card";
+    const heading = document.createElement("h3");
+    heading.textContent = "Step " + step.step;
+    const meta = document.createElement("p");
+    meta.className = "step-meta";
+    const bits = [];
+    if (step.started != null) bits.push(formatClock(step.started));
+    if (step.finished != null) bits.push("done " + formatClock(step.finished));
+    if (step.started != null) bits.push(formatSpan(step.started, step.finished));
+    if (step.retries.length) bits.push(step.retries.length + " model retries");
+    meta.textContent = bits.join(" · ");
+    card.append(heading, meta);
+    for (const retry of step.retries) {
+      const line = document.createElement("p");
+      line.className = "step-failure";
+      line.textContent = formatClock(retry.ts) + " · model retry " + retry.attempt + " · " + retry.reason + (retry.backoff != null ? " · backoff " + retry.backoff + "s" : "");
+      card.appendChild(line);
+    }
+    addBlock(card, "Context sent to the model", contextBefore(step.step));
+    addBlock(card, "Reasoning", step.reasoning);
+    addBlock(card, "Model response", step.content);
+    for (const tool of step.tools) {
+      const block = document.createElement("div");
+      block.className = "tool-block";
+      const name = document.createElement("h4");
+      const timing = tool.started != null ? " · " + formatSpan(tool.started, tool.finished) : "";
+      name.textContent = tool.name + " · " + (tool.status || "pending") + timing + (tool.host ? " · " + tool.host : "") + (tool.attempt ? " · attempt " + tool.attempt : "");
+      block.appendChild(name);
+      for (const failure of tool.failures) {
+        const line = document.createElement("p");
+        line.className = "step-failure";
+        line.textContent = failure;
+        block.appendChild(line);
+      }
+      addBlock(block, "Request", prettyArgs(tool.args));
+      addBlock(block, "Response", tool.result);
+      card.appendChild(block);
+    }
+    body.appendChild(card);
+  }
+}
+
+function toggleTrajectory() {
+  if (!selected) return;
+  trajectoryOpen = !trajectoryOpen;
+  document.getElementById("trajectory").setAttribute("aria-pressed", trajectoryOpen ? "true" : "false");
+  document.getElementById("trajectory-panel").hidden = !trajectoryOpen;
+  if (trajectoryOpen) renderTrajectory();
 }
 
 function toggleLiveCode() {
@@ -1126,6 +1486,14 @@ async function useDummy() {
   const body = await response.json();
   promptEl.value = body.text || "";
   submitKey = "";
+  const imported = await fetch("/api/imports/dummy", { method: "POST" });
+  if (!imported.ok) {
+    formError(await errorText(imported));
+    return;
+  }
+  const saved = await imported.json();
+  loadedImport = { id: saved.import_id, name: saved.name, files: saved.files || [] };
+  setFolderLabel();
 }
 
 async function cancelSession() {
@@ -1157,15 +1525,21 @@ document.getElementById("open-folder").addEventListener("click", () => {
   document.getElementById("folder-input").click();
 });
 document.getElementById("folder-input").addEventListener("change", (event) => {
-  const files = event.target.files;
-  if (files && files.length) chooseFolder(files);
+  const files = Array.from(event.target.files || []);
   event.target.value = "";
+  if (files.length) chooseFolder(files);
 });
 document.getElementById("clear-folder").addEventListener("click", () => {
   loadedImport = null;
   setFolderLabel();
 });
 document.getElementById("live-code").addEventListener("click", toggleLiveCode);
+document.getElementById("trajectory").addEventListener("click", toggleTrajectory);
+document.getElementById("trajectory-close").addEventListener("click", () => {
+  trajectoryOpen = false;
+  document.getElementById("trajectory").setAttribute("aria-pressed", "false");
+  document.getElementById("trajectory-panel").hidden = true;
+});
 document.getElementById("kill-backend").addEventListener("click", async () => {
   try {
     const response = await fetch(supervisorUrl("/kill-backend"), { method: "POST" });
@@ -1184,6 +1558,11 @@ sessionsEl.addEventListener("click", (event) => {
   if (button) selectSession(button.dataset.session);
 });
 hostsEl.addEventListener("click", (event) => {
+  const sessionButton = event.target.closest("button[data-session]");
+  if (sessionButton) {
+    selectSession(sessionButton.dataset.session);
+    return;
+  }
   const button = event.target.closest("button[data-kill]");
   if (button) killHost(button.dataset.kill);
 });

@@ -47,6 +47,7 @@ def _settings(tmp_path: Path) -> Settings:
 def test_sse_chunks_join_text_and_tool_arguments() -> None:
     builder = TurnBuilder()
     chunks = [
+        {"choices": [{"delta": {"reasoning_content": "Look at the file. "}}]},
         {"choices": [{"delta": {"content": "Hello "}}]},
         {"choices": [{"delta": {"content": "there"}}]},
         {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "read_file", "arguments": ""}}]}}]},
@@ -57,6 +58,7 @@ def test_sse_chunks_join_text_and_tool_arguments() -> None:
     assert "".join(texts) == "Hello there"
     turn = builder.turn()
     assert turn.content == "Hello there"
+    assert turn.reasoning == "Look at the file. "
     assert turn.tool_calls[0].id == "call_1"
     assert turn.tool_calls[0].name == "read_file"
     assert json.loads(turn.tool_calls[0].arguments) == {"path": "a.py"}

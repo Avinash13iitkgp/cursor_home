@@ -125,7 +125,12 @@ class Agent:
             await self._db(self.store.note_llm_started, self.owner, session.session_id, session.step)
             try:
                 tools = await self.scheduler.list_tools()
-                turn = await self._stream(session.session_id, [message.to_api() for message in messages], tools)
+                turn = await self._stream(
+                    session.session_id,
+                    session.step,
+                    [message.to_api() for message in messages],
+                    tools,
+                )
                 break
             except HostUnreachable as exc:
                 reason = "tools: %s" % exc.reason
@@ -142,7 +147,15 @@ class Agent:
                 return
             backoff = min(30, 2 ** (attempt - 1))
             logger.info("session %s llm retry %s in %ss (%s)", session.session_id, attempt, backoff, reason)
-            await self._db(self.store.note_llm_retry, self.owner, session.session_id, attempt, reason, backoff)
+            await self._db(
+                self.store.note_llm_retry,
+                self.owner,
+                session.session_id,
+                attempt,
+                reason,
+                backoff,
+                session.step,
+            )
             await self._sleep(backoff)
         await self._db(
             self.store.commit_model_turn,
@@ -151,15 +164,24 @@ class Agent:
             session.step,
             turn.content or None,
             parse_model_calls(turn),
+            turn.reasoning,
         )
 
-    async def _stream(self, session_id: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AssistantTurn:
+    async def _stream(
+        self,
+        session_id: str,
+        step: int,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> AssistantTurn:
         turn: AssistantTurn | None = None
         async for event in self.llm.chat(messages, tools):
             if not isinstance(event, StreamEvent):
                 continue
-            if event.kind == "text" and event.text:
-                self.events.emit_ephemeral(session_id, "assistant.delta", {"text": event.text})
+            if event.kind == "reasoning" and event.text:
+                self.events.emit_ephemeral(session_id, "assistant.reasoning", {"text": event.text, "step": step})
+            elif event.kind == "text" and event.text:
+                self.events.emit_ephemeral(session_id, "assistant.delta", {"text": event.text, "step": step})
             elif event.kind == "done" and event.turn is not None:
                 turn = event.turn
         if turn is None:
