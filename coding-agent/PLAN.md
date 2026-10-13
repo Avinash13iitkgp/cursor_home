@@ -70,7 +70,7 @@ coding-agent/
     db.py                     connection, PRAGMAs, schema, migrations
     store.py                  all SQL lives here; typed functions only
     events.py                 append event + in-process pub/sub fan-out
-    llm.py                    OpenAI-compatible streaming client + mock model
+    llm.py                    OpenAI-compatible streaming client for the live Grok API
     hosts.py                  DaemonClient (HTTP) + DockerControl (docker CLI)
     scheduler.py              host pick, health monitor, failover/replace
     agent.py                  ReAct step machine for one session
@@ -321,10 +321,15 @@ stateDiagram-v2
 
 ### LLM client (`llm.py`)
 
+The model is the live Grok API. Runs, streaming, and both crash demos go through it. There is no scripted stand-in on the demo path.
+
+- Default `LLM_MODE=live`. `CURSOR_BASE_URL=https://api.x.ai/v1`, `CURSOR_MODEL=grok-4`, unless the key's endpoint needs a different base URL or model name.
+- The key is written only to `coding-agent/.env` as `CURSOR_API_KEY`. That file is already in [.gitignore](.gitignore). It is never committed, never put in `PLAN.md`, and never logged. [.env.example](.env.example) keeps an empty `CURSOR_API_KEY=`.
 - `POST {CURSOR_BASE_URL}/chat/completions` with `{model, messages, tools, tool_choice: "auto", stream: true}` and `Authorization: Bearer {CURSOR_API_KEY}`, using httpx with `timeout=httpx.Timeout(connect=10, read=120, write=30, pool=10)`.
 - Parse `data:` lines, joining `delta.content` and `delta.tool_calls[i].function.arguments` by index. If the joined arguments are not valid JSON, the call goes back to the model as a tool error.
 - The `tools` parameter comes from the daemon's `tools/list` result, mapped to `{type: "function", function: {name, description, parameters: inputSchema}}` and cached per process.
-- `MockModel` is used when `LLM_MODE=mock`, or `auto` with no key. It plays a scripted run over the dummy repo, about 40 tool calls with `MOCK_STEP_DELAY_S=3` between them (roughly 2 to 3 minutes), so both crash demos work offline and the same way every time.
+- Startup refuses to boot when `LLM_MODE=live` and `CURSOR_API_KEY` is empty, so a missing key fails immediately instead of silently doing nothing.
+- Unit tests of the step machine inject a fake client. They do not call Grok and do not need the key.
 
 ### API (`api.py`)
 
@@ -382,7 +387,7 @@ A small Python package, `inventory`, with no third-party dependencies:
 - `README.md`.
 - `TASK.md`: "Fix the bugs in store.py so the tests describe correct behavior, implement `low_stock_report`, add a `remove` command to the CLI, and update README."
 
-That gives a real model a multi-file task with many reads and writes, which produces runs long enough for crash demos and can reach 10 to 15 minutes with a real model. Nothing sleeps to fake length except the mock model.
+That gives Grok a multi-file task with many reads and writes. A real run is long enough for the crash demos and can reach 10 to 15 minutes. Nothing is slept to stretch it.
 
 ## Execution steps
 
@@ -390,7 +395,7 @@ Each step ends in something that runs. Time estimates add up to about 3 h 50 m.
 
 ### Step 1: Scaffold and config (10 min)
 - Fill [backend/requirements.txt](backend/requirements.txt) with `fastapi`, `uvicorn`, `httpx`, `pydantic`, and `pytest`.
-- Write `backend/config.py`, which reads `.env` with a small parser, and add `MAX_STEPS`, `LEASE_TTL_S`, `MIGRATE_AFTER_S`, `MOCK_STEP_DELAY_S`, and `COW_ROOT` to [.env.example](.env.example).
+- Write `backend/config.py`, which reads `.env` with a small parser. Set `LLM_MODE=live` in [.env.example](.env.example), and add `MAX_STEPS`, `LEASE_TTL_S`, `MIGRATE_AFTER_S`, and `COW_ROOT`. Copy the example to `.env` and put the provided Grok key in `CURSOR_API_KEY` there only.
 - Write `scripts/dev.sh`, which runs `mkdir -p data/cow`, `docker compose up -d --build`, and `python -m backend.supervisor`.
 - **Done when:** the virtualenv installs cleanly.
 
@@ -411,8 +416,8 @@ Each step ends in something that runs. Time estimates add up to about 3 h 50 m.
 - **Done when:** after `docker kill coding-agent-host-a`, the backend logs show the sequence down, replacing, replaced with generation 2.
 
 ### Step 6: LLM and ReAct agent (40 min)
-- Write `llm.py` (streaming client plus `MockModel`), `agent.py` (step machine), and `runner.py` (claim, renew, tasks).
-- **Done when:** a session created through store runs to `completed` against host-a with the mock model, and `tool_calls` and `events` are filled in.
+- Write `llm.py` (streaming Grok client), `agent.py` (step machine), and `runner.py` (claim, renew, tasks).
+- **Done when:** a session created through store runs against host-a with the live Grok key, tool calls stream into `tool_calls` and `events`, and the step-machine unit tests pass with an injected fake client (no network).
 
 ### Step 7: API, SSE, supervisor (20 min)
 - Write `api.py` and `supervisor.py`.
