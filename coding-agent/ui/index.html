@@ -4,18 +4,22 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Coding agent</title>
-  <link rel="stylesheet" href="/styles.css?v=4">
+  <link rel="stylesheet" href="/styles.css?v=7">
 </head>
 <body>
   <header class="topbar">
-    <h1>Coding agent</h1>
-    <span id="connection" class="pill" data-state="reconnecting" aria-live="polite">reconnecting (0)</span>
+    <div class="brand">
+      <h1>Coding agent</h1>
+      <span id="connection" class="pill" data-state="reconnecting" aria-live="polite">reconnecting (0)</span>
+    </div>
     <div class="hosts-wrap">
       <h2>Hosts</h2>
       <div id="hosts" class="hosts"></div>
     </div>
-    <span id="supervisor" class="supervisor">supervisor …</span>
-    <button type="button" id="kill-backend" class="danger">Kill backend</button>
+    <div class="top-actions">
+      <span id="supervisor" class="supervisor">supervisor …</span>
+      <button type="button" id="kill-backend" class="danger">Kill backend</button>
+    </div>
   </header>
   <main class="columns">
     <section class="col tasks" aria-label="Tasks">
@@ -131,6 +135,6 @@
     </header>
     <div id="timeline-panel-body" class="trajectory-body"></div>
   </section>
-  <script src="/app.js?v=4"></script>
+  <script src="/app.js?v=6"></script>
 </body>
 </html>

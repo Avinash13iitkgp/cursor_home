@@ -147,3 +147,42 @@ def test_run_tests_uses_the_session_workspace(tmp_path: Path) -> None:
         assert not (baseline / "tests" / "test_session_marker.py").exists()
     finally:
         server.shutdown()  # type: ignore[attr-defined]
+
+
+def test_shell_lists_and_replay_appends_once(tmp_path: Path) -> None:
+    server, base = _start(tmp_path)
+    try:
+        listed = _json("POST", base + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        result = listed["result"]
+        assert isinstance(result, dict)
+        names = [tool["name"] for tool in result["tools"]]
+        assert "shell" in names
+
+        created = _json("POST", base + "/workspaces", {"session_id": "s_shell"})
+        assert created["created"] is True
+        call = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "shell",
+                "arguments": {"command": "printf 'line\\n' >> proof.txt"},
+                "_meta": {"session_id": "s_shell", "op_id": "s_shell.0.0"},
+            },
+        }
+        first = _json("POST", base + "/mcp", call)
+        second = _json("POST", base + "/mcp", call)
+        first_result = first["result"]
+        second_result = second["result"]
+        assert isinstance(first_result, dict) and isinstance(second_result, dict)
+        assert first_result["isError"] is False
+        assert first_result["_meta"]["replayed"] is False
+        assert second_result["_meta"]["replayed"] is True
+        assert second_result["content"][0]["text"] == first_result["content"][0]["text"]
+        assert "exit=0" in first_result["content"][0]["text"]
+        proof = tmp_path / "cow" / "sessions" / "s_shell" / "workspace" / "proof.txt"
+        base_proof = tmp_path / "cow" / "base" / "dummy-repo" / "proof.txt"
+        assert proof.read_text(encoding="utf-8") == "line\n"
+        assert not base_proof.exists()
+    finally:
+        server.shutdown()  # type: ignore[attr-defined]

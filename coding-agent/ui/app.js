@@ -856,6 +856,7 @@ function renderTimeline() {
     const main = document.createElement("div");
     main.className = "tl-main";
     const time = document.createElement("span");
+    time.className = "tl-time";
     time.textContent = formatClock(event.ts);
     const type = document.createElement("span");
     type.className = "type";
@@ -868,14 +869,14 @@ function renderTimeline() {
       main.appendChild(badge);
     }
     main.appendChild(type);
-    row.appendChild(main);
     const extra = [event.host_id].filter(Boolean).join("  ");
     if (extra) {
-      const line = document.createElement("div");
+      const line = document.createElement("span");
       line.className = "tl-extra";
       line.textContent = extra;
-      row.appendChild(line);
+      main.appendChild(line);
     }
+    row.appendChild(main);
     if (isTool) {
       row.addEventListener("click", () => openTimelineEvent(event));
     }
@@ -1194,7 +1195,9 @@ function renderHosts() {
         row.type = "button";
         row.className = "host-session" + (session.session_id === selected ? " selected" : "");
         row.dataset.session = session.session_id;
-        row.textContent = session.title || session.session_id;
+        const label = session.title || session.session_id;
+        row.textContent = label;
+        row.title = label;
         list.appendChild(row);
       }
       card.appendChild(list);

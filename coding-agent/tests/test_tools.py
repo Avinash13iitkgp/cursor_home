@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -120,6 +121,74 @@ def test_run_tests_reports_failures_and_refuses_the_baseline(tmp_path: Path, mon
         run_tool(session, "run_tests", {"pattern": "tests/test_token.py"})
     with pytest.raises(ToolError, match="escapes"):
         run_tool(session, "run_tests", {"path": "../s_one"})
+
+
+def _assert_dead(pid: int) -> None:
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError("process %s is still alive" % pid)
+        time.sleep(0.05)
+
+
+def test_shell_runs_in_the_workspace(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    result = run_tool(workspace, "shell", {"command": "printf 'from-shell\\n' > proof.txt"})
+    assert "exit=0" in result
+    assert (workspace / "proof.txt").read_text(encoding="utf-8") == "from-shell\n"
+
+
+def test_shell_cwd_cannot_escape(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    (workspace / "link").symlink_to(outside)
+    marker = "shell-escape-%s.txt" % tmp_path.name
+    for cwd in ("/tmp", "../outside", "link"):
+        with pytest.raises(ToolError):
+            run_tool(workspace, "shell", {"command": "printf 'nope\\n' > %s" % marker, "cwd": cwd})
+    assert not (outside / marker).exists()
+    assert not (Path("/tmp") / marker).exists()
+
+
+def test_shell_nonzero_exit_is_text(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    result = run_tool(workspace, "shell", {"command": "printf 'nope\\n' >&2; exit 3"})
+    assert "exit=3" in result
+    assert "nope" in result
+
+
+def test_shell_timeout_kills_the_process_group(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    pid_path = workspace / "sleep.pid"
+    started = time.monotonic()
+    with pytest.raises(ToolError, match="timed out"):
+        run_tool(
+            workspace,
+            "shell",
+            {"command": "sleep 60 & echo $! > sleep.pid; sleep 60", "timeout_s": 1},
+        )
+    elapsed = time.monotonic() - started
+    assert elapsed < 8
+    pid = int(pid_path.read_text(encoding="utf-8").strip())
+    try:
+        _assert_dead(pid)
+    finally:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+
+def test_shell_rejects_empty_command(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    with pytest.raises(ToolError, match="command"):
+        run_tool(workspace, "shell", {"command": ""})
 
 
 def test_mkdir_and_delete_are_idempotent(tmp_path: Path) -> None:
