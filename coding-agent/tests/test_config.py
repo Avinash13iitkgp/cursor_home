@@ -19,7 +19,7 @@ def test_example_file_loads_live_defaults(tmp_path: Path) -> None:
     settings = load_settings(env_file, environ={})
     assert settings.llm_mode == "live"
     assert settings.cursor_base_url == "https://api.x.ai/v1"
-    assert settings.cursor_model == "grok-4"
+    assert settings.cursor_model == "grok-4.7"
     assert settings.cursor_api_key == ""
     assert settings.max_steps == 30
     assert settings.lease_ttl_s == 10

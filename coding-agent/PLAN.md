@@ -323,7 +323,7 @@ stateDiagram-v2
 
 The model is the live Grok API. Runs, streaming, and both crash demos go through it. There is no scripted stand-in on the demo path.
 
-- Default `LLM_MODE=live`. `CURSOR_BASE_URL=https://api.x.ai/v1`, `CURSOR_MODEL=grok-4`, unless the key's endpoint needs a different base URL or model name.
+- Default `LLM_MODE=live`. `CURSOR_BASE_URL=https://api.x.ai/v1`, `CURSOR_MODEL=grok-4.7`, unless the key's endpoint needs a different base URL or model name.
 - The key is written only to `coding-agent/.env` as `CURSOR_API_KEY`. That file is already in [.gitignore](.gitignore). It is never committed, never put in `PLAN.md`, and never logged. [.env.example](.env.example) keeps an empty `CURSOR_API_KEY=`.
 - `POST {CURSOR_BASE_URL}/chat/completions` with `{model, messages, tools, tool_choice: "auto", stream: true}` and `Authorization: Bearer {CURSOR_API_KEY}`, using httpx with `timeout=httpx.Timeout(connect=10, read=120, write=30, pool=10)`.
 - Parse `data:` lines, joining `delta.content` and `delta.tool_calls[i].function.arguments` by index. If the joined arguments are not valid JSON, the call goes back to the model as a tool error.

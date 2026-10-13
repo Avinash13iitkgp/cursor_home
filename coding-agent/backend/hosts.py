@@ -81,7 +81,9 @@ def to_openai_tools(specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 class DaemonClient:
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
-        self._client = client if client is not None else httpx.AsyncClient()
+        self._client = client if client is not None else httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=256, max_keepalive_connections=64),
+        )
         self._owns_client = client is None
 
     async def aclose(self) -> None:

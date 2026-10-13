@@ -80,7 +80,7 @@ def load_settings(
         root=ROOT if env_file is None else path.parent,
         cursor_base_url=_pick(values, "CURSOR_BASE_URL", "https://api.x.ai/v1").rstrip("/"),
         cursor_api_key=_pick(values, "CURSOR_API_KEY", ""),
-        cursor_model=_pick(values, "CURSOR_MODEL", "grok-4"),
+        cursor_model=_pick(values, "CURSOR_MODEL", "grok-4.7"),
         llm_mode=_pick(values, "LLM_MODE", "live"),
         hosts=(hosts[0], hosts[1]),
         daemon_image=_pick(values, "DAEMON_IMAGE", "coding-agent-daemon:local"),
@@ -97,7 +97,7 @@ def load_settings(
         cow_root=cow_root,
         db_path=_path(values, "DB_PATH", ROOT / "data" / "agent.db"),
         runner_poll_s=_number(values, "RUNNER_POLL_S", 1),
-        max_concurrent=_integer(values, "MAX_CONCURRENT", 4),
+        max_concurrent=_integer(values, "MAX_CONCURRENT", 10),
     )
 
 

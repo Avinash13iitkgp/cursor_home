@@ -26,6 +26,15 @@ def test_hosts_do_not_import_the_store() -> None:
     assert "backend.api" not in modules
 
 
+def test_agent_does_not_import_hosts_or_api() -> None:
+    modules = _imports(ROOT / "backend" / "agent.py")
+    assert "backend.store" in modules
+    assert "backend.scheduler" in modules
+    assert "backend.llm" in modules
+    assert "backend.hosts" not in modules
+    assert "backend.api" not in modules
+
+
 def test_scheduler_reaches_docker_only_through_hosts() -> None:
     modules = _imports(ROOT / "backend" / "scheduler.py")
     assert "backend.store" in modules
