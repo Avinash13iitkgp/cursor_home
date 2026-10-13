@@ -1,0 +1,379 @@
+"""HTTP API and server-sent events. The UI owns nothing; this process does."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, AsyncIterator, Optional
+from uuid import uuid4
+
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from backend.agent import Agent
+from backend.config import Settings, load_settings
+from backend.events import EventLog
+from backend.hosts import DaemonClient, DockerControl, DockerError
+from backend.llm import GrokClient
+from backend.runner import Runner
+from backend.scheduler import Scheduler
+from backend.store import Event, Message, Session, SessionNotFound, Store, ToolCall
+
+logger = logging.getLogger(__name__)
+
+PING_INTERVAL_S = 15.0
+
+
+def format_sse(event: Event, *, retry: bool = False) -> str:
+    payload = {
+        "seq": event.seq,
+        "session_id": event.session_id,
+        "ts": event.ts,
+        "type": event.type,
+        "op_id": event.op_id,
+        "host_id": event.host_id,
+        "payload": event.payload,
+    }
+    lines: list[str] = []
+    if retry:
+        lines.append("retry: 1000")
+    if not event.ephemeral and event.seq:
+        lines.append("id: %s" % event.seq)
+    lines.append("event: %s" % event.type)
+    lines.append("data: %s" % json.dumps(payload, separators=(",", ":")))
+    return "\n".join(lines) + "\n\n"
+
+
+def _session_dict(session: Session) -> dict[str, Any]:
+    return {
+        "session_id": session.session_id,
+        "idempotency_key": session.idempotency_key,
+        "title": session.title,
+        "prompt": session.prompt,
+        "status": session.status,
+        "step": session.step,
+        "max_steps": session.max_steps,
+        "host_id": session.host_id,
+        "host_generation": session.host_generation,
+        "lease_owner": session.lease_owner,
+        "lease_expires_at": session.lease_expires_at,
+        "final_answer": session.final_answer,
+        "error": session.error,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+    }
+
+
+def _message_dict(message: Message) -> dict[str, Any]:
+    return {
+        "idx": message.idx,
+        "role": message.role,
+        "content": message.content,
+        "tool_calls_json": message.tool_calls_json,
+        "tool_call_id": message.tool_call_id,
+        "step": message.step,
+        "created_at": message.created_at,
+    }
+
+
+def _tool_dict(call: ToolCall) -> dict[str, Any]:
+    return {
+        "op_id": call.op_id,
+        "step": call.step,
+        "call_index": call.call_index,
+        "model_call_id": call.model_call_id,
+        "tool_name": call.tool_name,
+        "args_json": call.args_json,
+        "status": call.status,
+        "attempts": call.attempts,
+        "host_id": call.host_id,
+        "host_generation": call.host_generation,
+        "replayed": call.replayed,
+        "result_json": call.result_json,
+        "error": call.error,
+        "created_at": call.created_at,
+        "started_at": call.started_at,
+        "finished_at": call.finished_at,
+    }
+
+
+async def iter_events(
+    events: EventLog,
+    replay: list[Event],
+    *,
+    session_id: str | None,
+    after: int,
+    ping_interval_s: float = PING_INTERVAL_S,
+) -> AsyncIterator[str]:
+    """Replay stored rows, then live events. A seq already sent is not sent again."""
+    queue = events.subscribe()
+    sent: set[int] = set()
+    first = True
+    try:
+        for event in replay:
+            sent.add(event.seq)
+            yield format_sse(event, retry=first)
+            first = False
+        if first:
+            yield "retry: 1000\n\n"
+            first = False
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=ping_interval_s)
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+                continue
+            if event.ephemeral:
+                if session_id is None or event.session_id == session_id:
+                    yield format_sse(event)
+                continue
+            if session_id is not None and event.session_id != session_id:
+                continue
+            if session_id is None and event.session_id is not None and event.type != "session.migrated":
+                continue
+            if event.seq <= after or event.seq in sent:
+                continue
+            sent.add(event.seq)
+            yield format_sse(event)
+    finally:
+        events.unsubscribe(queue)
+
+
+def create_app(
+    settings: Settings,
+    store: Store,
+    events: EventLog,
+    scheduler: Any = None,
+    *,
+    start_background: bool = False,
+    runner: Runner | None = None,
+    owner: str = "api",
+) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        events.bind(asyncio.get_running_loop())
+        tasks: list[asyncio.Task[None]] = []
+        if start_background:
+            for spec in settings.hosts:
+                await asyncio.to_thread(
+                    store.upsert_host,
+                    spec.host_id,
+                    spec.endpoint,
+                    spec.container_name,
+                    spec.port,
+                )
+            await asyncio.to_thread(
+                store.append_event,
+                type="backend.started",
+                payload={"instance_id": owner},
+            )
+            if runner is not None:
+                tasks.append(asyncio.create_task(runner.loop()))
+                tasks.append(asyncio.create_task(runner.renew_loop()))
+            if scheduler is not None:
+                tasks.append(asyncio.create_task(scheduler.health_loop()))
+        try:
+            yield
+        finally:
+            if runner is not None:
+                runner._stop = True
+            if scheduler is not None and hasattr(scheduler, "_stop"):
+                scheduler._stop = True
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    app = FastAPI(lifespan=lifespan)
+    app.state.settings = settings
+    app.state.store = store
+    app.state.events = events
+    app.state.scheduler = scheduler
+    app.state.runner = runner
+    app.state.owner = owner
+    app.state.start_background = start_background
+
+    @app.post("/api/sessions")
+    async def create_session(
+        body: dict[str, Any],
+        idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        if not idempotency_key:
+            raise HTTPException(status_code=400, detail="Idempotency-Key is required")
+        prompt = body.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise HTTPException(status_code=400, detail="prompt is required")
+        title = body.get("title")
+        if title is not None and not isinstance(title, str):
+            raise HTTPException(status_code=400, detail="title must be a string")
+        session = await asyncio.to_thread(
+            store.create_session,
+            prompt=prompt,
+            max_steps=settings.max_steps,
+            system_prompt=_system_prompt(),
+            idempotency_key=idempotency_key,
+            title=title,
+        )
+        return {"session": _session_dict(session)}
+
+    @app.get("/api/sessions")
+    async def list_sessions() -> dict[str, Any]:
+        sessions = await asyncio.to_thread(store.list_sessions)
+        return {"sessions": [_session_dict(session) for session in sessions]}
+
+    @app.get("/api/sessions/{session_id}")
+    async def get_session(session_id: str) -> dict[str, Any]:
+        try:
+            session = await asyncio.to_thread(store.get_session, session_id)
+        except SessionNotFound as exc:
+            raise HTTPException(status_code=404, detail="session not found") from exc
+        messages = await asyncio.to_thread(store.list_messages, session_id)
+        calls = await asyncio.to_thread(store.list_tool_calls, session_id)
+        latest = await asyncio.to_thread(store.latest_event_seq, session_id)
+        return {
+            "session": _session_dict(session),
+            "messages": [_message_dict(message) for message in messages],
+            "tool_calls": [_tool_dict(call) for call in calls],
+            "latest_event_seq": latest,
+        }
+
+    @app.post("/api/sessions/{session_id}/cancel")
+    async def cancel_session(session_id: str) -> dict[str, Any]:
+        try:
+            session = await asyncio.to_thread(store.cancel_session, session_id)
+        except SessionNotFound as exc:
+            raise HTTPException(status_code=404, detail="session not found") from exc
+        return {"session": _session_dict(session)}
+
+    @app.get("/api/sessions/{session_id}/events")
+    async def session_events(session_id: str, request: Request, after: int = 0) -> StreamingResponse:
+        try:
+            await asyncio.to_thread(store.get_session, session_id)
+        except SessionNotFound as exc:
+            raise HTTPException(status_code=404, detail="session not found") from exc
+        after = _after(request, after)
+        replay = await asyncio.to_thread(store.events_after, session_id, after)
+        stream = iter_events(events, replay, session_id=session_id, after=after)
+        return StreamingResponse(stream, media_type="text/event-stream", headers=_sse_headers())
+
+    @app.get("/api/events")
+    async def global_events(request: Request, after: int = 0) -> StreamingResponse:
+        after = _after(request, after)
+        replay = await asyncio.to_thread(store.global_events_after, after)
+        stream = iter_events(events, replay, session_id=None, after=after)
+        return StreamingResponse(stream, media_type="text/event-stream", headers=_sse_headers())
+
+    @app.get("/api/hosts")
+    async def list_hosts() -> dict[str, Any]:
+        hosts = await asyncio.to_thread(store.list_hosts)
+        counts = await asyncio.to_thread(store.active_counts)
+        return {
+            "hosts": [
+                {
+                    "host_id": host.host_id,
+                    "endpoint": host.endpoint,
+                    "port": host.port,
+                    "container_name": host.container_name,
+                    "status": host.status,
+                    "generation": host.generation,
+                    "boot_id": host.boot_id,
+                    "consecutive_failures": host.consecutive_failures,
+                    "last_heartbeat_at": host.last_heartbeat_at,
+                    "active_sessions": counts.get(host.host_id, 0),
+                }
+                for host in hosts
+            ]
+        }
+
+    @app.post("/api/hosts/{host_id}/kill")
+    async def kill_host(host_id: str) -> dict[str, Any]:
+        try:
+            host = await asyncio.to_thread(store.get_host, host_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="host not found") from exc
+        if scheduler is None:
+            raise HTTPException(status_code=503, detail="scheduler is not running")
+        try:
+            await scheduler.docker.kill(host.container_name)
+        except DockerError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {"killed": host.container_name}
+
+    @app.get("/api/task")
+    async def task_text() -> dict[str, str]:
+        path = settings.root / "dummy-repo" / "TASK.md"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="TASK.md not found")
+        return {"text": path.read_text(encoding="utf-8")}
+
+    ui_dir = settings.root / "ui"
+    if ui_dir.is_dir():
+        app.mount("/", StaticFiles(directory=str(ui_dir), html=True), name="ui")
+
+    return app
+
+
+def build_app(settings: Settings) -> FastAPI:
+    """Wire the live process: one runner, one model client, up to MAX_CONCURRENT loops."""
+    settings.validate_for_boot()
+    store = Store.open(settings.db_path)
+    events = EventLog(store)
+    owner = str(uuid4())
+    daemon = DaemonClient()
+    docker = DockerControl()
+    scheduler = Scheduler(store, daemon, docker, settings, owner)
+    llm = GrokClient(settings)
+    agent = Agent(
+        store,
+        events,
+        scheduler,
+        llm,
+        owner,
+        max_model_retries=settings.max_model_retries,
+        max_host_retries=settings.max_host_retries,
+        host_give_up_s=settings.host_give_up_s,
+    )
+    runner = Runner(store, agent, owner, settings)
+    return create_app(
+        settings,
+        store,
+        events,
+        scheduler,
+        start_background=True,
+        runner=runner,
+        owner=owner,
+    )
+
+
+def _production_app() -> FastAPI:
+    return build_app(load_settings())
+
+
+def __getattr__(name: str) -> FastAPI:
+    if name == "app":
+        return _production_app()
+    raise AttributeError(name)
+
+
+def _system_prompt() -> str:
+    return (
+        "You are a coding agent working in a workspace that already contains a Python project. "
+        "Inspect and edit files only through the provided tools. "
+        "Paths are relative to the workspace root. "
+        "When the task is finished, reply with a short summary and do not call any tools."
+    )
+
+
+def _after(request: Request, query_after: int) -> int:
+    header = request.headers.get("last-event-id")
+    if header and header.isdigit():
+        return max(query_after, int(header))
+    return query_after
+
+
+def _sse_headers() -> dict[str, str]:
+    return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
