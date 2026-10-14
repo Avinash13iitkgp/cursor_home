@@ -16,7 +16,7 @@ These invariants in the prototype are the production design, not throwaway demo 
 - **Host identity.** `boot_id` changes on process start. `generation` increments on replace. `docker rm -f` runs before the new container starts, so two daemons are not supposed to write one session.
 - **Shared workspace.** Both containers bind-mount the same `data/cow/`, which is why migration after `MIGRATE_AFTER_S` (20s) can resume the same files.
 
-Crash windows the demo already covers: die during the model stream (nothing committed, call the model again), die after the assistant row commits (pending tools run), die during a tool call (same `op_id` replays or reruns), die after the daemon replied but before SQLite commit (journal replay).
+The crash windows the demo already survives are listed under [Failure modes](#failure-modes).
 
 ```mermaid
 flowchart TD
@@ -40,29 +40,63 @@ flowchart TD
 
 
 
-## Failures the prototype can still hit
+## Failure modes
 
-These are real gaps in the current code, even with one user.
+The demo survives a dead backend and a killed host. The gaps below still run a tool twice, leave an old call running, or stall recovery. They show up with one user.
 
-**A host can get stuck in** `replacing`**.** [backend/scheduler.py](backend/scheduler.py) `observe` returns `"busy"` when `status == "replacing"` and never starts recovery. `replace_host` only clears that status on success (`mark_replaced`) or on a 30s timeout (`force_down`). If the backend is killed mid-replace, the new process sees `replacing`, refuses to touch the host, and every session pinned to it waits until `host_give_up_s` (60s) and then fails. The "kill both" demo hits this window.
+### Already covered
 
-`generation` **is recorded, not enforced.** Tool calls store `host_generation`, but `call_tool` does not reject a stale generation. The only fence is `docker rm -f` on the same machine. A container that survives `rm`, or a second backend that also calls Docker, can still accept work.
+The backend commits the intent to SQLite before the side effect, and the daemon journals the result under `op_id`.
 
-**The op journal lock is in-process.** Workspace create uses `fcntl.flock` in [daemon/workspace.py](daemon/workspace.py). The journal uses `threading.Lock` only. Two daemon processes that both miss `ops/<op_id>.json` both run the tool. One backend avoids this because it waits for `docker rm -f` before retrying. Two backends, or a timeout retry against a live daemon on another host, do not.
+- The backend dies during the model stream. Nothing was committed, so the new process calls the model again.
+- The backend dies after the assistant row is saved. Pending tool rows are still there, so the new owner runs them.
+- The backend dies after the daemon finished but before SQLite records it. The retry uses the same `op_id`, reads `ops/<op_id>.json`, and does not run the tool again.
+- Host-a is actually killed. After three missed heartbeats the session row moves to host-b. Both containers mount `data/cow/`, so host-b sees the workspace and any journal file host-a managed to write. About 20 seconds later `docker rm` destroys host-a.
 
-**Timeout versus still-running.** `TOOL_TIMEOUT_S` is 60. On timeout, `report_failure` probes `/health`. If the host answers, it is marked healthy and the same `op_id` is retried. The same daemon serializes that retry on the journal lock, so file tools are safe. A migrated host does not share that lock.
+Moving a session does not hand over the lease. The same backend keeps `lease_owner` and only changes `sessions.host_id`. The lease stops a second backend from committing SQLite. It does not stop a daemon from writing files.
+
+### Two executions of one `op_id`
+
+The journal lock is a `threading.Lock` inside one daemon. Workspace create uses `fcntl.flock` in [daemon/workspace.py](daemon/workspace.py). The journal does not. Host-b does not share that lock. Both look for `ops/<op_id>.json`, and both run the tool if the file is not there yet.
+
+That happens when the backend gives up on host-a while host-a is still inside the tool, then retries on host-b. `TOOL_TIMEOUT_S` is 60. On timeout, `report_failure` probes `/health`. If host-a answers, it stays healthy and the retry hits the same daemon, which serializes on the in-process lock. If the probe fails too, the session moves and host-b starts the same `op_id`. A container the user already killed is not still executing. The scheduler's own `docker rm` is about 20 seconds later, after the move. A false "host down" never removes the container, so the old call runs to the end as well.
+
+`write_file` usually lands on the same bytes. `replace_in_file` can apply twice if both calls see the old text. `shell` and `run_tests` just run twice.
+
+### The old call is not cancelled
+
+`tools/call` does not watch the lease, the host generation, or the client socket. It finishes the tool, writes the journal, and then replies. If the backend has already timed out, the reply is discarded and the side effect remains.
+
+[backend/store.py](backend/store.py) `cancel_session` only clears the lease. The Grok stream and the daemon call keep going. The next SQLite write raises `LeaseLost` and drops the result. The process is still running.
+
+The only hard stop is destroying the container, and that is 20 seconds after the move, not at the moment of the move. A generation check on the next request does not stop the call that already started. The retry on host-b is in addition to the old call until that process dies.
+
+### Fences that are recorded and not checked
+
+- `lease_owner` stops a second backend from committing session rows. The daemon never reads it.
+- `host_generation` is stored on the tool row. `call_tool` does not send it, and the daemon does not compare it. An old container still accepts work. The only fence is `docker rm -f` on the same machine. A container that survives `rm`, or a second backend that also calls Docker, can still write.
+- `op_id` is `{session}.{step}.{call_index}`. It does not include the arguments. A retry with different arguments and the same id gets the old journal body back and does not run. Hashing the inputs into the id would be wrong for a second `shell` or `run_tests` that happens to look the same. A hash stored next to the id, rejected when it differs, is the missing check.
+
+### Recovery that gets stuck or reordered
+
+- **Stuck `replacing`.** [backend/scheduler.py](backend/scheduler.py) `observe` returns `"busy"` when `status == "replacing"` and never starts recovery. `replace_host` only clears that status on success (`mark_replaced`) or on a 30s timeout (`force_down`). If the backend is killed mid-replace, the new process sees `replacing`, refuses to touch the host, and every session pinned to it waits until `host_give_up_s` (60s) and then fails. The "kill both" demo hits this window.
+- **Replace is not its own state machine.** Timeout marks the host `down` and returns. The health loop will try again, but `_replacing` is memory-only, and a crash between `docker rm` and `docker run` has no persisted recovery step to resume.
+- **The session moves before the container dies.** `_note_failure` updates `host_id` immediately. The container restart waits 20 seconds. During that window the session is on host-b and host-a may still be executing.
+- **Leases use the wall clock.** `lease_expires_at` is `time.time()`, renewed every 3s with a 10s TTL. An NTP step can expire every lease at once, or keep a dead owner's lease alive. A stall longer than the TTL lets a second backend claim the session while the first is still in a tool call. Scheduler methods call SQLite directly on the event loop (`record_health_success`, `get_session` inside `wait_for_host`), while the agent uses `asyncio.to_thread`. A slow `BEGIN IMMEDIATE` stalls health, renewal, and streaming together.
+
+### Idempotency does not cover every tool
+
+File tools are built so a second run with the same arguments is harmless: atomic replace, `exist_ok`, delete-if-absent, `already_applied`. That is the safety net for a duplicate run.
+
+`shell` starts a real process. `run_tests` runs the suite again. A crash after the process starts and before the journal file exists will run them twice, and nothing rolls the workspace back. `atomic_write` is per file. A tool that edits two files can leave the pair half-applied, and the journal then replays that as success.
 
 **Model calls are at-least-once and billed twice.** Nothing is written before `llm.chat`. A crash, a 429, or a lease loss after the stream still costs a full completion. Retries in [backend/agent.py](backend/agent.py) use `min(30, 2 ** (attempt - 1))` with no jitter, then fail the session after 5 tries. A provider blip fails user work instead of parking it.
 
-**Cancel does not stop the in-flight call.** [backend/store.py](backend/store.py) `cancel_session` clears the lease, so the next SQLite write raises `LeaseLost` and drops the result. The HTTP stream to Grok and the daemon call run until they finish.
+### Other prototype limits
 
-**Leases use wall clock.** `lease_expires_at` is `time.time()`. An NTP step can expire every lease at once, or keep a dead owner's lease alive. Renewal is every 3s with a 10s TTL. Anything that stalls the event loop for longer than the TTL lets a second owner start. Scheduler methods call SQLite directly on the event loop (`record_health_success`, `get_session` inside `wait_for_host`), while the agent correctly uses `asyncio.to_thread`. A slow `BEGIN IMMEDIATE` stalls health, renewal, and streaming together.
+`waiting_host` holds a concurrency slot. Default `MAX_CONCURRENT` is 10. A session waiting on Docker still occupies one of those 10 tasks. Ten stuck hosts means the runner claims nothing else.
 
-`waiting_host` **holds a concurrency slot.** Default `MAX_CONCURRENT` is 10. A session waiting on Docker still occupies one of those 10 tasks. Ten stuck hosts means the runner claims nothing else.
-
-**Replace is not retried as its own state machine.** Timeout marks the host `down` and returns. The health loop will try again, but `_replacing` is memory-only, and a crash during `docker rm` / `docker run` has no persisted "recovery step" to resume.
-
-**One volume, no quotas, no cleanup.** Session directories and `ops/*.json` are never deleted. The base tree is immutable only by convention. A write into `data/cow/base/` would change every session that has not yet copy-on-written that path. `atomic_write` is per file; a tool that must update two files can leave the pair half-applied, and the journal then replays the success of a partial logical edit.
+**One volume, no quotas, no cleanup.** Session directories and `ops/*.json` are never deleted. The base tree is immutable only by convention. A write into `data/cow/base/` would change every session that has not yet copy-on-written that path.
 
 **Isolation is a Python check.** Every daemon bind-mounts all of `data/cow/`. Path checks live in the tool process. There is no auth on `:8080`, `:8090`, or `POST /api/hosts/{id}/kill`. `docker.sock` is effectively in the control plane. One bad tool, or one open kill endpoint, sees every workspace.
 
