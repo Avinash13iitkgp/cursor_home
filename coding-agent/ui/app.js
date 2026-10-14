@@ -2081,6 +2081,18 @@ async function startTask(event) {
   }
 }
 
+const SHELL_CLOCK_PROMPT = [
+  "Use only the shell tool. Do not create or edit files.",
+  "",
+  "Call shell with timeout_s 10 and this command:",
+  "",
+  "python3 -c 'import datetime; current_time = datetime.datetime.now().astimezone().isoformat(timespec=\"seconds\"); print(current_time)'",
+  "",
+  "When the result comes back, call that same command again immediately. Keep going until the timestamps span 100 seconds from the first print. One print per call, so each time shows up on its own tool card.",
+  "",
+  "The shell runs on the host this session is assigned to. The card shows that host. If the session moves to the other host, keep the same loop so both hosts print the time.",
+].join("\n");
+
 const NEW_CODEBASE_PROMPT = [
   "Create a new Python package named splitbill.",
   "",
@@ -2137,6 +2149,16 @@ function useNewCodebase() {
   selectSample("new");
 }
 
+function useShellClock() {
+  sampleToken += 1;
+  formError("");
+  loadedImport = null;
+  setFolderLabel();
+  promptEl.value = SHELL_CLOCK_PROMPT;
+  submitKey = "";
+  selectSample("clock");
+}
+
 async function cancelSession(sessionId) {
   const id = typeof sessionId === "string" ? sessionId : selected;
   if (!id) return;
@@ -2160,6 +2182,7 @@ async function killHost(hostId) {
 document.getElementById("task-form").addEventListener("submit", startTask);
 document.getElementById("dummy").addEventListener("click", useDummy);
 document.getElementById("new-codebase").addEventListener("click", useNewCodebase);
+document.getElementById("shell-clock").addEventListener("click", useShellClock);
 promptEl.addEventListener("input", () => {
   submitKey = "";
   clearSampleSelection();
