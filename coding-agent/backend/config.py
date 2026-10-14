@@ -54,6 +54,7 @@ class Settings:
     db_path: Path
     runner_poll_s: float
     max_concurrent: int
+    llm_reasoning_effort: str = ""
 
     def validate_for_boot(self) -> None:
         if self.llm_mode != "live":
@@ -104,6 +105,7 @@ def load_settings(
         db_path=_path(values, "DB_PATH", ROOT / "data" / "agent.db"),
         runner_poll_s=_number(values, "RUNNER_POLL_S", 1),
         max_concurrent=_integer(values, "MAX_CONCURRENT", 10),
+        llm_reasoning_effort=_pick(values, "LLM_REASONING_EFFORT", "").lower(),
     )
 
 

@@ -21,6 +21,7 @@ def test_example_file_loads_live_defaults(tmp_path: Path) -> None:
     assert settings.cursor_base_url == "https://api.x.ai/v1"
     assert settings.cursor_model == "grok-4.7"
     assert settings.cursor_api_key == ""
+    assert settings.llm_reasoning_effort == "low"
     assert settings.max_steps == 200
     assert settings.max_model_retries == 5
     assert settings.max_host_retries == 5
@@ -56,6 +57,13 @@ def test_max_rounds_is_accepted_when_max_steps_is_absent(tmp_path: Path) -> None
     env_file = _write_env(tmp_path / ".env", "MAX_ROUNDS=7\n")
     settings = load_settings(env_file, environ={})
     assert settings.max_steps == 7
+
+
+def test_reasoning_effort_is_optional(tmp_path: Path) -> None:
+    env_file = _write_env(tmp_path / ".env", "CURSOR_MODEL=grok-4.7\n")
+    assert load_settings(env_file, environ={}).llm_reasoning_effort == ""
+    raised = load_settings(env_file, environ={"LLM_REASONING_EFFORT": "High"})
+    assert raised.llm_reasoning_effort == "high"
 
 
 def test_relative_cow_root_resolves_under_project(tmp_path: Path) -> None:

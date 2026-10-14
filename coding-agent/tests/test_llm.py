@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 
@@ -104,7 +105,30 @@ def test_client_streams_and_hides_the_key(tmp_path: Path) -> None:
         assert isinstance(body, dict)
         assert body["stream"] is True
         assert body["model"] == "grok-4"
+        assert "reasoning_effort" not in body
         assert "secret-key" not in json.dumps(turn.tool_calls[0].arguments)
+
+    asyncio.run(scenario())
+
+
+def test_reasoning_effort_is_sent_when_set(tmp_path: Path) -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, text="data: [DONE]\n")
+
+    async def scenario() -> None:
+        settings = dataclasses.replace(_settings(tmp_path), llm_reasoning_effort="low")
+        client = GrokClient(settings, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        try:
+            async for _event in client.chat([{"role": "user", "content": "go"}], []):
+                pass
+        finally:
+            await client.aclose()
+        body = seen["body"]
+        assert isinstance(body, dict)
+        assert body["reasoning_effort"] == "low"
 
     asyncio.run(scenario())
 

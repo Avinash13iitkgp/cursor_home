@@ -156,6 +156,8 @@ class GrokClient:
             "tool_choice": "auto",
             "stream": True,
         }
+        if self._settings.llm_reasoning_effort:
+            body["reasoning_effort"] = self._settings.llm_reasoning_effort
         headers = {"Authorization": "Bearer %s" % self._settings.cursor_api_key}
         builder = TurnBuilder()
         try:

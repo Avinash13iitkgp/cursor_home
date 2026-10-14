@@ -357,7 +357,7 @@ textarea {
 }
 .traj-status.succeeded, .traj-status.done { color: var(--ok); border-color: #b7dfc8; background: #e7f6ee; }
 .traj-status.failed { color: var(--bad); border-color: #e7b4b4; background: #fdecec; }
-.traj-status.running, .traj-status.streaming, .traj-status.retrying { color: var(--warn); border-color: #ead3a4; background: #fff6e8; }
+.traj-status.running, .traj-status.streaming, .traj-status.retrying, .traj-status.thinking { color: var(--warn); border-color: #ead3a4; background: #fff6e8; }
 .traj-status.pending { color: var(--muted); }
 .traj-tool { color: #5b3cc4; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 .traj-path {

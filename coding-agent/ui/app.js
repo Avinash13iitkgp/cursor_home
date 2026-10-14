@@ -244,6 +244,35 @@ function ensureDraft() {
   return bubble;
 }
 
+function openModelCall() {
+  let open = null;
+  let closedAt = 0;
+  for (const event of timeline) {
+    if (event.session_id !== selected) continue;
+    if (event.type === "llm.started") {
+      if (!open || event.seq > open.seq) open = event;
+    } else if (event.type === "assistant.message" || event.type === "session.completed" || event.type === "session.failed") {
+      closedAt = Math.max(closedAt, event.seq);
+    }
+  }
+  return open && open.seq > closedAt ? open : null;
+}
+
+// Grok does not stream its reasoning, so the only live signal before the first
+// token is how long ago llm.started was logged. The timeline is the source so a
+// reload mid-call, which skips events below floor, still shows the timer.
+function renderThinking() {
+  const session = sessions.find((item) => item.session_id === selected);
+  if (!session || TERMINAL.has(session.status)) return;
+  const open = openModelCall();
+  if (!open || open.ts == null) return;
+  const bubble = ensureDraft();
+  const thinking = bubble.querySelector(".thinking");
+  if (!thinking || thinking.dataset.live === "1" || thinking.hidden) return;
+  const step = open.payload && open.payload.step != null ? " on step " + open.payload.step : "";
+  thinking.textContent = "Model thinking" + step + "\u2026 " + formatSpan(open.ts, null);
+}
+
 function appendReasoning(text) {
   if (!text) return;
   const stick = nearBottom(transcriptEl);
@@ -957,6 +986,7 @@ function applyTranscript(event) {
   if (event.type === "llm.started") {
     const stick = nearBottom(transcriptEl);
     ensureDraft();
+    renderThinking();
     if (stick) transcriptEl.scrollTop = transcriptEl.scrollHeight;
     return;
   }
@@ -1658,6 +1688,7 @@ function renderTrajectory() {
     body.appendChild(empty);
     return;
   }
+  const live = Boolean(session) && ["queued", "running", "waiting_host"].includes(session.status);
   for (const step of steps) {
     const streaming = step.started != null && !step.finished && (liveText || liveReasoning);
     const failed = step.retries.length || step.tools.some((tool) => tool.status === "failed" || tool.failures.length);
@@ -1667,8 +1698,9 @@ function renderTrajectory() {
     const stepName = document.createElement("span");
     stepName.textContent = "Step " + step.step;
     const state = document.createElement("span");
-    state.className = "traj-status " + (streaming ? "running" : failed ? "failed" : step.finished ? "succeeded" : "pending");
-    state.textContent = streaming ? "streaming" : failed ? "failed" : step.finished ? "done" : "pending";
+    const thinking = live && !streaming && step.started != null && !step.finished;
+    state.className = "traj-status " + (streaming ? "running" : thinking ? "thinking" : failed ? "failed" : step.finished ? "succeeded" : "pending");
+    state.textContent = streaming ? "streaming" : thinking ? "thinking" : failed ? "failed" : step.finished ? "done" : "pending";
     heading.append(stepName, state);
     const meta = document.createElement("p");
     meta.className = "step-meta";
@@ -2220,6 +2252,8 @@ pollSupervisor();
 setInterval(() => {
   renderElapsed();
   renderHeartbeatAges();
+  renderThinking();
+  if (trajectoryOpen && document.querySelector("#trajectory-body .traj-status.thinking")) renderTrajectory();
 }, 1000);
 setInterval(() => {
   refreshSessions();
